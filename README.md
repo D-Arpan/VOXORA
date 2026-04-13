@@ -98,7 +98,7 @@ Runs:
 - 🔄 Backend server  
 - 🌐 Frontend  
 
-All in one terminal with unified logs.
+All in one terminal with unified logs. This may thorw an error.
 
 ---
 
