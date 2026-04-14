@@ -197,5 +197,6 @@ http://localhost:3000
 ```
 faster-whisper>=1.1.0
 numpy>=1.24.0
+python-dotenv>=1.0.1
 vosk>=0.3.45
 ```
