@@ -255,18 +255,61 @@ function initWebSocket(server) {
                     Object.prototype.hasOwnProperty.call(event, "partial");
 
                 if (hasStructuredPartial) {
+                    const stable = String(event.stable || "");
+                    const partial = String(event.partial || "");
+                    const combined = `${stable} ${partial}`.trim();
+                    const partialConfidences = Array.isArray(event.partial_confidences)
+                        ? event.partial_confidences
+                            .map((value) => Number(value))
+                            .filter((value) => Number.isFinite(value))
+                        : [];
                     safeSend(ws, {
                         type: "partial",
-                        stable: String(event.stable || ""),
-                        partial: String(event.partial || ""),
+                        text: combined,
+                        stable,
+                        partial,
+                        partialConfidences,
+                        stabilityLevel: Number.isFinite(Number(event.stability_level))
+                            ? Number(event.stability_level)
+                            : undefined,
+                        speechWps: Number.isFinite(Number(event.speech_wps))
+                            ? Number(event.speech_wps)
+                            : undefined,
+                        emitIntervalMs: Number.isFinite(Number(event.emit_interval_ms))
+                            ? Number(event.emit_interval_ms)
+                            : undefined,
+                        rms: Number.isFinite(Number(event.rms))
+                            ? Number(event.rms)
+                            : undefined,
+                        silenceMs: Number.isFinite(Number(event.silence_ms))
+                            ? Number(event.silence_ms)
+                            : undefined,
+                        thinking: typeof event.thinking === "boolean"
+                            ? event.thinking
+                            : undefined,
+                        prediction: typeof event.prediction === "string"
+                            ? event.prediction
+                            : undefined,
+                        calibrated: typeof event.calibrated === "boolean"
+                            ? event.calibrated
+                            : undefined,
+                        calibrationProgress: Number.isFinite(Number(event.calibration_progress))
+                            ? Number(event.calibration_progress)
+                            : undefined,
+                        confidenceBaseline: Number.isFinite(Number(event.confidence_baseline))
+                            ? Number(event.confidence_baseline)
+                            : undefined,
                     });
                     return;
                 }
 
+                const text = String(event.text || "");
                 safeSend(ws, {
                     type: "partial",
-                    stable: String(event.text || ""),
+                    text,
+                    stable: text,
                     partial: "",
+                    partialConfidences: [],
                 });
                 return;
             }

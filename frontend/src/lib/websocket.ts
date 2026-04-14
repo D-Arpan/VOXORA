@@ -1,7 +1,19 @@
 export type PartialMessage = {
     type: "partial";
+    text: string;
     stable: string;
     partial: string;
+    partialConfidences: number[];
+    stabilityLevel?: number;
+    speechWps?: number;
+    emitIntervalMs?: number;
+    rms?: number;
+    silenceMs?: number;
+    thinking?: boolean;
+    prediction?: string;
+    calibrated?: boolean;
+    calibrationProgress?: number;
+    confidenceBaseline?: number;
 };
 
 export type FinalMessage = {
@@ -61,10 +73,39 @@ function parseServerMessage(raw: string): ServerMessage | null {
     const type = String(candidate.type || "");
 
     if (type === "partial") {
+        const text = String(candidate.text || "");
+        const stable = String(candidate.stable || "");
+        const partial = String(candidate.partial || "");
+        const resolvedText = text || `${stable} ${partial}`.trim();
+        const partialConfidences = Array.isArray(candidate.partialConfidences)
+            ? candidate.partialConfidences
+                .map((value) => Number(value))
+                .filter((value) => Number.isFinite(value))
+            : [];
+        const stabilityLevel = Number(candidate.stabilityLevel);
+        const speechWps = Number(candidate.speechWps);
+        const emitIntervalMs = Number(candidate.emitIntervalMs);
+        const rms = Number(candidate.rms);
+        const silenceMs = Number(candidate.silenceMs);
+        const calibrationProgress = Number(candidate.calibrationProgress);
+        const confidenceBaseline = Number(candidate.confidenceBaseline);
+
         return {
             type: "partial",
-            stable: String(candidate.stable || candidate.text || ""),
-            partial: String(candidate.partial || ""),
+            text: resolvedText,
+            stable: stable || resolvedText,
+            partial,
+            partialConfidences,
+            stabilityLevel: Number.isFinite(stabilityLevel) ? stabilityLevel : undefined,
+            speechWps: Number.isFinite(speechWps) ? speechWps : undefined,
+            emitIntervalMs: Number.isFinite(emitIntervalMs) ? emitIntervalMs : undefined,
+            rms: Number.isFinite(rms) ? rms : undefined,
+            silenceMs: Number.isFinite(silenceMs) ? silenceMs : undefined,
+            thinking: typeof candidate.thinking === "boolean" ? candidate.thinking : undefined,
+            prediction: typeof candidate.prediction === "string" ? candidate.prediction : undefined,
+            calibrated: typeof candidate.calibrated === "boolean" ? candidate.calibrated : undefined,
+            calibrationProgress: Number.isFinite(calibrationProgress) ? calibrationProgress : undefined,
+            confidenceBaseline: Number.isFinite(confidenceBaseline) ? confidenceBaseline : undefined,
         };
     }
 
@@ -136,6 +177,28 @@ export class RealtimeSocket {
         this.socket = ws;
     }
 
+    async waitForOpen(timeoutMs: number = 2500, pollMs: number = 25): Promise<boolean> {
+        if (this.isOpen()) {
+            return true;
+        }
+
+        const startedAt = Date.now();
+        return new Promise((resolve) => {
+            const interval = window.setInterval(() => {
+                if (this.isOpen()) {
+                    window.clearInterval(interval);
+                    resolve(true);
+                    return;
+                }
+
+                if (Date.now() - startedAt >= timeoutMs) {
+                    window.clearInterval(interval);
+                    resolve(false);
+                }
+            }, pollMs);
+        });
+    }
+
     isOpen(): boolean {
         return this.socket?.readyState === WebSocket.OPEN;
     }
@@ -166,4 +229,3 @@ export class RealtimeSocket {
         this.socket = null;
     }
 }
-
