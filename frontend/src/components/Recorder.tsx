@@ -2,20 +2,26 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Mic, Square, Copy, Check, RotateCcw, Sparkles } from "lucide-react";
+import { Mic, Square, Copy, Check } from "lucide-react";
 import { RealtimeSocket, type ServerMessage } from "@/lib/websocket";
 
+/* ====== SAME LOGIC (UNCHANGED) ====== */
 const DEFAULT_CHUNK_MS = 25;
 const MIN_CHUNK_MS = 20;
 const MAX_CHUNK_MS = 30;
+
 const CHUNK_MS = (() => {
     const parsed = Number(process.env.NEXT_PUBLIC_RECORDER_CHUNK_MS || DEFAULT_CHUNK_MS);
-    return isFinite(parsed) ? Math.min(MAX_CHUNK_MS, Math.max(MIN_CHUNK_MS, Math.floor(parsed))) : DEFAULT_CHUNK_MS;
+    return isFinite(parsed)
+        ? Math.min(MAX_CHUNK_MS, Math.max(MIN_CHUNK_MS, Math.floor(parsed)))
+        : DEFAULT_CHUNK_MS;
 })();
 
 function pickMimeType(): string {
     if (typeof MediaRecorder === "undefined") return "audio/webm";
-    return MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
+    return MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus"
+        : "audio/webm";
 }
 
 export default function PerfectPremiumRecorder() {
@@ -102,6 +108,7 @@ export default function PerfectPremiumRecorder() {
         );
         socketRef.current = socket;
         socket.connect();
+
         return () => {
             stopRecorderOnly();
             stopTracks();
@@ -120,11 +127,12 @@ export default function PerfectPremiumRecorder() {
         }
 
         setError("");
-        if (finalText) clearTranscript(); // Auto-clear if starting fresh
+        if (finalText) clearTranscript();
 
         try {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
             streamRef.current = stream;
+
             const mimeType = pickMimeType();
             const recorder = new MediaRecorder(stream, { mimeType });
             recorderRef.current = recorder;
@@ -138,6 +146,7 @@ export default function PerfectPremiumRecorder() {
 
             socketRef.current.sendCommand({ type: "start", mimeType });
             recorder.start(CHUNK_MS);
+
             setIsRecording(true);
             setStatus("listening");
         } catch (err) {
@@ -156,134 +165,129 @@ export default function PerfectPremiumRecorder() {
 
     const hasContent = !!(finalText || stableText || partialText);
 
+    /* ====== UI REDESIGN STARTS HERE ====== */
+
     return (
-        <div className="min-h-screen bg-[#0a0a0a] text-zinc-100 flex flex-col items-center justify-center p-4 sm:p-8 font-sans selection:bg-indigo-500/30">
+        <div className="min-h-screen bg-black flex items-center justify-center p-6 text-white">
 
-            <motion.div
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
-                className="w-full max-w-3xl flex flex-col h-[80vh] max-h-[800px] relative"
-            >
-                {/* Background Ambient Glow */}
-                <div className="absolute inset-0 bg-gradient-to-b from-indigo-500/5 to-transparent rounded-3xl pointer-events-none blur-3xl" />
+            <div className="w-full max-w-6xl h-[520px] rounded-3xl border border-white/10 bg-[#0b0f14]/80 backdrop-blur-xl shadow-2xl flex overflow-hidden">
 
-                <div className="flex-1 flex flex-col bg-[#111111]/80 backdrop-blur-2xl border border-white/[0.05] rounded-[2rem] shadow-2xl overflow-hidden relative z-10">
+                {/* LEFT PANEL */}
+                <div className="w-1/2 flex flex-col items-center justify-center border-r border-white/10 relative">
 
-                    {/* Header & AI Core */}
-                    <div className="flex flex-col items-center justify-center pt-10 pb-6 px-8 relative z-20">
-                        <div className="relative flex items-center justify-center w-16 h-16 mb-4">
-                            {/* Pulsing Orb */}
-                            <motion.div
-                                animate={{
-                                    scale: isRecording ? [1, 1.5, 1] : [1, 1.05, 1],
-                                    opacity: isRecording ? [0.4, 0.8, 0.4] : [0.1, 0.2, 0.1]
-                                }}
-                                transition={{
-                                    duration: isRecording ? 1.5 : 4,
-                                    repeat: Infinity,
-                                    ease: "easeInOut"
-                                }}
-                                className={`absolute inset-0 rounded-full blur-xl transition-colors duration-700 ${isRecording ? 'bg-indigo-500' : 'bg-zinc-500'}`}
-                            />
-                            <div className={`relative z-10 w-4 h-4 rounded-full transition-colors duration-700 shadow-inner ${isRecording ? 'bg-indigo-400 shadow-indigo-200' : 'bg-zinc-600'}`} />
-                        </div>
+                    <div className="absolute inset-0 bg-gradient-to-br from-cyan-500/10 via-transparent to-indigo-500/10 blur-2xl" />
 
-                        <h2 className="text-sm font-medium text-zinc-400 tracking-wide uppercase flex items-center gap-2">
-                            {isRecording ? "Listening..." : "Voice Intelligence"}
-                        </h2>
+                    <div className="relative z-10 flex flex-col items-center">
+
+                        <p className="text-xs text-zinc-500 tracking-widest mb-2">AI CORE</p>
+                        <h2 className="text-xl font-semibold mb-6">Voice Intelligence</h2>
+
+                        {/* Wave Circle */}
+                        <motion.div
+                            animate={isRecording ? { scale: [1, 1.15, 1] } : { scale: 1 }}
+                            transition={
+                                isRecording
+                                    ? { repeat: Infinity, duration: 1.5 }
+                                    : { duration: 0 }
+                            }
+                            className="w-40 h-40 rounded-full border border-cyan-400/30 flex items-center justify-center mb-6"
+                        >
+                            <div className="flex gap-[2px]">
+                                {Array.from({ length: 25 }).map((_, i) => (
+                                    <motion.div
+                                        key={i}
+                                        animate={isRecording ? { height: [4, 22, 6] } : { height: 4 }}
+                                        transition={
+                                            isRecording
+                                                ? { repeat: Infinity, duration: 1, delay: i * 0.04 }
+                                                : { duration: 0 }
+                                        }
+                                        className="w-[2px] bg-cyan-400"
+                                    />
+                                ))}
+                            </div>
+                        </motion.div>
+
+                        <h1 className="text-4xl font-light mb-2">00:00</h1>
+                        <p className="text-xs text-zinc-500 uppercase tracking-wider mb-6">
+                            {isRecording
+                                ? "RECORDING"
+                                : status === "processing"
+                                    ? "PROCESSING"
+                                    : status === "connecting"
+                                        ? "CONNECTING"
+                                        : "READY"}
+                        </p>
+
+                        <button
+                            onClick={isRecording ? stopRecording : startRecording}
+                            className={`px-10 py-3 rounded-xl font-medium tracking-wide transition-all ${isRecording
+                                    ? "border border-red-500 text-red-400 hover:bg-red-500/10"
+                                    : "bg-gradient-to-r from-cyan-500 to-indigo-500 text-black"
+                                }`}
+                        >
+                            {isRecording ? "STOP SESSION" : "START SESSION"}
+                        </button>
 
                         {error && (
-                            <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="mt-4 px-4 py-2 bg-red-500/10 border border-red-500/20 text-red-400 text-sm rounded-full">
-                                {error}
-                            </motion.div>
+                            <p className="mt-4 text-red-400 text-sm">{error}</p>
                         )}
                     </div>
+                </div>
 
-                    {/* Transcript Area */}
-                    <div className="flex-1 overflow-y-auto px-8 sm:px-12 pb-24 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
-                        <AnimatePresence mode="wait">
+                {/* RIGHT PANEL */}
+                <div className="w-1/2 flex flex-col">
+
+                    {/* TRANSCRIPT */}
+                    <div className="flex-1 p-6 overflow-y-auto">
+                        <p className="text-xs text-zinc-500 tracking-widest mb-4">TRANSCRIPT</p>
+
+                        <AnimatePresence>
                             {!hasContent ? (
-                                <motion.div
-                                    key="empty"
+                                <motion.p
                                     initial={{ opacity: 0 }}
                                     animate={{ opacity: 1 }}
-                                    exit={{ opacity: 0 }}
-                                    className="h-full flex flex-col items-center justify-center text-center space-y-4"
+                                    className="text-zinc-600"
                                 >
-                                    <Sparkles className="w-8 h-8 text-zinc-700" />
-                                    <p className="text-xl sm:text-2xl text-zinc-500 font-light tracking-tight">
-                                        What is on your mind?
-                                    </p>
-                                </motion.div>
+                                    Start speaking...
+                                </motion.p>
                             ) : (
-                                <motion.div
-                                    key="content"
-                                    initial={{ opacity: 0 }}
-                                    animate={{ opacity: 1 }}
-                                    className="text-2xl sm:text-3xl md:text-4xl leading-[1.4] font-light tracking-tight"
-                                >
-                                    <span className="text-zinc-100">{stableText} </span>
-                                    <motion.span
-                                        layout
-                                        className="text-indigo-300/70 blur-[0.5px]"
-                                    >
-                                        {partialText}
-                                    </motion.span>
+                                <motion.div className="text-lg leading-relaxed">
+                                    <span className="text-white">{stableText} </span>
+                                    <span className="text-cyan-300/60">{partialText}</span>
                                 </motion.div>
                             )}
                         </AnimatePresence>
                     </div>
 
-                    {/* Action Dock (Bottom Overlay) */}
-                    <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-4 p-2 bg-zinc-900/80 backdrop-blur-xl border border-white/10 rounded-full shadow-2xl z-30">
+                    {/* FOOTER */}
+                    <div className="border-t border-white/10 p-4 flex items-center justify-between">
 
-                        {/* Clear Button */}
-                        <button
-                            onClick={clearTranscript}
-                            disabled={!hasContent || isRecording}
-                            className="w-12 h-12 flex items-center justify-center text-zinc-400 hover:text-zinc-100 disabled:opacity-30 disabled:cursor-not-allowed transition-colors rounded-full hover:bg-white/5"
-                            title="Clear Transcript"
-                        >
-                            <RotateCcw className="w-5 h-5" />
-                        </button>
+                        <div>
+                            <p className="text-xs text-cyan-400 tracking-widest">LIVE INFERENCE</p>
+                            <p className="text-xs text-zinc-500">
+                                {isRecording
+                                    ? "Listening..."
+                                    : status === "processing"
+                                        ? "Processing..."
+                                        : status === "connecting"
+                                            ? "Connecting..."
+                                            : "Ready"}
+                            </p>
+                        </div>
 
-                        {/* Main Record Button */}
-                        <motion.button
-                            whileHover={{ scale: 1.05 }}
-                            whileTap={{ scale: 0.95 }}
-                            onClick={isRecording ? stopRecording : startRecording}
-                            className={`w-16 h-16 flex items-center justify-center rounded-full shadow-lg transition-all duration-300 ${isRecording
-                                    ? "bg-zinc-800 text-red-400 border border-red-500/30 hover:bg-zinc-700"
-                                    : "bg-white text-black hover:bg-zinc-200"
-                                }`}
-                        >
-                            <AnimatePresence mode="wait">
-                                {isRecording ? (
-                                    <motion.div key="stop" initial={{ scale: 0 }} animate={{ scale: 1 }} exit={{ scale: 0 }}>
-                                        <Square className="w-6 h-6 fill-current" />
-                                    </motion.div>
-                                ) : (
-                                    <motion.div key="mic" initial={{ scale: 0 }} animate={{ scale: 1 }} exit={{ scale: 0 }}>
-                                        <Mic className="w-6 h-6 fill-current" />
-                                    </motion.div>
-                                )}
-                            </AnimatePresence>
-                        </motion.button>
-
-                        {/* Copy Button */}
                         <button
                             onClick={copyToClipboard}
                             disabled={!hasContent}
-                            className="w-12 h-12 flex items-center justify-center text-zinc-400 hover:text-zinc-100 disabled:opacity-30 disabled:cursor-not-allowed transition-colors rounded-full hover:bg-white/5"
-                            title="Copy to Clipboard"
+                            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 transition disabled:opacity-30"
                         >
-                            {copied ? <Check className="w-5 h-5 text-emerald-400" /> : <Copy className="w-5 h-5" />}
+                            {copied ? <Check size={16} /> : <Copy size={16} />}
+                            Copy
                         </button>
 
                     </div>
                 </div>
-            </motion.div>
+            </div>
         </div>
     );
 }

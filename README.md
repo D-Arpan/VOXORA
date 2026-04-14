@@ -40,7 +40,7 @@ cd <your-repo-name>
 
 cd backend && npm install
 cd ../frontend && npm install
-cd ../backend/python && python -m pip install -r requirements.txt
+cd ../backend && python -m venv .venv && .venv\Scripts\Activate && pip install vosk faster-whisper numpy sounddevice python-dotenv
 ```
 
 ---
@@ -98,7 +98,7 @@ Runs:
 - 🔄 Backend server  
 - 🌐 Frontend  
 
-All in one terminal with unified logs.
+All in one terminal with unified logs. This may thorw an error.
 
 ---
 
