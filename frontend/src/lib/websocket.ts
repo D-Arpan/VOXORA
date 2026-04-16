@@ -26,12 +26,17 @@ export type StatusMessage = {
     state: string;
 };
 
+export type ProcessingMessage = {
+    type: "processing";
+    status: string;
+};
+
 export type ErrorMessage = {
     type: "error";
     message: string;
 };
 
-export type ServerMessage = PartialMessage | FinalMessage | StatusMessage | ErrorMessage;
+export type ServerMessage = PartialMessage | FinalMessage | StatusMessage | ProcessingMessage | ErrorMessage;
 
 type EventHandlers = {
     onMessage: (message: ServerMessage) => void;
@@ -120,6 +125,13 @@ function parseServerMessage(raw: string): ServerMessage | null {
         return {
             type: "status",
             state: String(candidate.state || ""),
+        };
+    }
+
+    if (type === "processing") {
+        return {
+            type: "processing",
+            status: String(candidate.status || "refining"),
         };
     }
 

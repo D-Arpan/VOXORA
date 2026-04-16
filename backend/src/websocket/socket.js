@@ -335,6 +335,14 @@ function initWebSocket(server) {
                     type: "status",
                     state: String(event.state || "unknown"),
                 });
+                return;
+            }
+
+            if (event.type === "processing") {
+                safeSend(ws, {
+                    type: "processing",
+                    status: String(event.status || "refining"),
+                });
             }
         });
 

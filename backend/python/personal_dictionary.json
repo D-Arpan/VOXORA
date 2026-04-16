@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "case_map": {
+    "arpan": "Arpan",
+    "voxora": "Voxora",
+    "websocket": "WebSocket",
+    "node.js": "Node.js",
+    "python": "Python",
+    "whisper": "Whisper",
+    "vosk": "Vosk",
+    "[unk].": "[unk]."
+  },
+  "phrase_map": {
+    "web socket": "WebSocket",
+    "node js": "Node.js",
+    "node . js": "Node.js",
+    "[unk]": "[unk]."
+  }
+}

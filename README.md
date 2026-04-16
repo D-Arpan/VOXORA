@@ -141,6 +141,11 @@ LATENCY_FEEDBACK_HIGH_MS=165
 SILENCE_FEEDBACK_FREQUENT_RATE=0.28
 CPU_PRESSURE_RATIO=0.9
 CPU_GUARD_EMIT_SHIFT_MS=18
+WHISPER_BEAM_SIZE=3
+WHISPER_MIN_SEGMENT_SECONDS=3
+WHISPER_MAX_SEGMENT_SECONDS=5
+WHISPER_FINAL_FLUSH_TIMEOUT_SECONDS=3
+WHISPER_LOW_CONFIDENCE_LOGPROB=-1.35
 
 WHISPER_MODEL_SIZE=small.en
 WHISPER_COMPUTE_TYPE=int8
@@ -204,7 +209,8 @@ http://localhost:3000
 - Runtime feedback loop: correction rate, silence behavior, and latency signals continuously tune confirmation, confidence, and pause sensitivity.
 - CPU guardrail: when process pressure rises, prediction is reduced and emit interval is relaxed to keep UI responsive.
 - Short pauses: stabilization logic reduces flicker and can add lightweight pause punctuation.
-- On stop: full-audio whisper pass produces corrected final transcript.
+- Incremental Whisper runs during streaming on bounded 3-5s segments; processed audio is never reprocessed.
+- On stop: only remaining tail audio is finalized, then final transcript is emitted with a processing state event.
 - Error-pattern learning: learns case/phrase corrections from partial-vs-final differences and reuses them next session.
 - UI replaces live partial text with final transcript using trust-layer transitions (minor corrections merge softly; major changes highlight).
 

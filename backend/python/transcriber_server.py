@@ -123,7 +123,7 @@ MAX_AUDIO_BUFFER_SECONDS = parse_int_env("MAX_AUDIO_BUFFER_SECONDS", 1800)
 MAX_AUDIO_BUFFER_BYTES = SAMPLE_RATE * 2 * MAX_AUDIO_BUFFER_SECONDS
 SILENCE_THRESHOLD_MS = parse_int_env("SILENCE_THRESHOLD_MS", 600)
 SILENCE_COMMIT_DELAY_MS = parse_int_env("SILENCE_COMMIT_DELAY_MS", 200)
-MIN_SEGMENT_WORDS = parse_int_env("MIN_SEGMENT_WORDS", 2)
+MIN_SEGMENT_WORDS = parse_int_env("MIN_SEGMENT_WORDS", 4)
 SPEECH_RMS_THRESHOLD = parse_float_env("SPEECH_RMS_THRESHOLD", 0.01)
 EMPTY_PARTIAL_STREAK_COMMIT = parse_int_env("EMPTY_PARTIAL_STREAK_COMMIT", 3)
 PARTIAL_HISTORY_SIZE = max(2, min(5, parse_int_env("PARTIAL_HISTORY_SIZE", 3)))
@@ -147,11 +147,6 @@ ADAPTIVE_PAUSE_MAX_MS = 2200
 DEFAULT_PHRASE_BIAS_TERMS = [
     "Arpan",
     "Voxora",
-    "WebSocket",
-    "Node.js",
-    "Python",
-    "Whisper",
-    "Vosk",
 ]
 PHRASE_BIAS_TERMS = parse_csv_env("PHRASE_BIAS_TERMS", DEFAULT_PHRASE_BIAS_TERMS)
 
@@ -183,6 +178,21 @@ WHISPER_CPU_THREADS = parse_int_env(
     "WHISPER_CPU_THREADS",
     max(1, (os.cpu_count() or 4) // 2),
 )
+WHISPER_BEAM_SIZE = max(1, min(3, parse_int_env("WHISPER_BEAM_SIZE", 3)))
+WHISPER_BEST_OF = max(1, min(2, parse_int_env("WHISPER_BEST_OF", 1)))
+WHISPER_MIN_SEGMENT_SECONDS = max(3.0, min(4.0, parse_float_env("WHISPER_MIN_SEGMENT_SECONDS", 3.2)))
+WHISPER_MAX_SEGMENT_SECONDS = max(3.5, min(4.5, parse_float_env("WHISPER_MAX_SEGMENT_SECONDS", 3.8)))
+WHISPER_FINAL_FLUSH_TIMEOUT_SECONDS = max(
+    1.0,
+    min(4.0, parse_float_env("WHISPER_FINAL_FLUSH_TIMEOUT_SECONDS", 2.2)),
+)
+WHISPER_LOW_CONFIDENCE_LOGPROB = parse_float_env("WHISPER_LOW_CONFIDENCE_LOGPROB", -1.35)
+# Hard backpressure ceiling: never allow more than 3 unprocessed Whisper segments.
+WHISPER_QUEUE_MAX_SIZE = 3
+WHISPER_MICRO_BATCH_MIN_SECONDS = max(0.7, min(1.2, parse_float_env("WHISPER_MICRO_BATCH_MIN_SECONDS", 0.95)))
+WHISPER_FINAL_TAIL_SECONDS = max(2.0, min(3.0, parse_float_env("WHISPER_FINAL_TAIL_SECONDS", 2.8)))
+WHISPER_PROGRESS_EMIT_INTERVAL_MS = max(80, parse_int_env("WHISPER_PROGRESS_EMIT_INTERVAL_MS", 180))
+WHISPER_DEBUG_EMIT_INTERVAL_MS = max(120, parse_int_env("WHISPER_DEBUG_EMIT_INTERVAL_MS", 350))
 ENABLE_LIGHT_GRAMMAR = parse_bool_env("ENABLE_LIGHT_GRAMMAR", True)
 
 TOKEN_GRAMMAR_REPLACEMENTS = {
@@ -406,8 +416,8 @@ def build_phrase_bias_grammar(terms: List[str]) -> Optional[str]:
             entries.append(candidate)
             seen.add(candidate)
 
-    if "[unk]" not in seen:
-        entries.append("[unk]")
+    # if "[unk]" not in seen:
+    #     entries.append("[unk]")
 
     if not entries:
         return None
@@ -668,7 +678,20 @@ class ClientSession:
         self.stream_flushed = threading.Event()
 
         self.stream_queue: "queue.Queue[object]" = queue.Queue(maxsize=STREAM_QUEUE_SIZE)
+        self.whisper_queue: "queue.Queue[object]" = queue.Queue(maxsize=max(8, WHISPER_QUEUE_MAX_SIZE * 4))
         self.audio_buffer_bytes = bytearray()
+        self.whisper_processed_offset_bytes = 0
+        self.whisper_active_jobs = 0
+        self.whisper_final_text = ""
+        self.whisper_segment_count = 0
+        self.whisper_last_enqueue_timestamp = 0.0
+        self.whisper_last_progress_emit_timestamp = 0.0
+        self.whisper_last_debug_emit_timestamp = 0.0
+        self.whisper_avg_processing_delay_ms = 0.0
+        self.whisper_last_processing_delay_ms = 0.0
+        self.whisper_dynamic_beam_size = WHISPER_BEAM_SIZE
+        self.whisper_final_flush_duration_ms = 0.0
+        self.session_epoch = 0
 
         self.is_recording = False
         self.recognizer: Optional[KaldiRecognizer] = None
@@ -685,6 +708,7 @@ class ClientSession:
         self.last_audio_rms = 0.0
         self.empty_partial_streak = 0
         self.pause_commit_done = False
+        self.is_finalizing = False
         self.partial_history: Deque[List[str]] = deque(maxlen=PARTIAL_HISTORY_SIZE)
         self.segment_confirmed_words: List[str] = []
         self.partial_prev_words: List[str] = []
@@ -754,11 +778,13 @@ class ClientSession:
         self.learned_phrase_map.setdefault("node . js", "Node.js")
 
         self.stream_thread = threading.Thread(target=self.streaming_loop, daemon=True)
+        self.whisper_thread = threading.Thread(target=self.whisper_worker_loop, daemon=True)
         self.final_thread = threading.Thread(target=self.final_loop, daemon=True)
 
     def run(self) -> None:
         try:
             self.stream_thread.start()
+            self.whisper_thread.start()
             self.final_thread.start()
             self.reader_loop()
         except Exception as exc:
@@ -767,6 +793,7 @@ class ClientSession:
         finally:
             self.close()
             self.stream_thread.join(timeout=2)
+            self.whisper_thread.join(timeout=2)
             self.final_thread.join(timeout=2)
             print(f"[python] Connection closed: {self.address}")
 
@@ -777,6 +804,7 @@ class ClientSession:
         self.closed.set()
         self.final_requested.set()
         self.enqueue_stop_token()
+        self.enqueue_whisper_stop_token()
         try:
             self.conn.shutdown(socket.SHUT_RDWR)
         except OSError:
@@ -918,8 +946,22 @@ class ClientSession:
 
         now = time.monotonic()
         with self.state_lock:
+            self.session_epoch += 1
             self.clear_stream_queue()
+            self.clear_whisper_queue()
             self.audio_buffer_bytes.clear()
+            self.whisper_processed_offset_bytes = 0
+            self.whisper_active_jobs = 0
+            self.whisper_final_text = ""
+            self.whisper_segment_count = 0
+            self.whisper_last_enqueue_timestamp = 0.0
+            self.whisper_last_progress_emit_timestamp = 0.0
+            self.whisper_last_debug_emit_timestamp = 0.0
+            self.whisper_avg_processing_delay_ms = 0.0
+            self.whisper_last_processing_delay_ms = 0.0
+            self.whisper_dynamic_beam_size = WHISPER_BEAM_SIZE
+            self.whisper_final_flush_duration_ms = 0.0
+            self.is_finalizing = False
             self.stable_text = ""
             self.partial_text = ""
             self.partial_confidences = []
@@ -1001,7 +1043,11 @@ class ClientSession:
             if not self.is_recording:
                 return
             self.is_recording = False
+            self.is_finalizing = True
+            self._enqueue_whisper_segments_locked(force=True, priority=True)
 
+        self.send_event({"type": "processing", "status": "refining"})
+        self.emit_processing_debug_event(force=True)
         self.enqueue_stop_token()
         self.final_requested.set()
 
@@ -1018,10 +1064,30 @@ class ClientSession:
             except queue.Full:
                 pass
 
+    def enqueue_whisper_stop_token(self) -> None:
+        try:
+            self.whisper_queue.put_nowait(STOP_TOKEN)
+        except queue.Full:
+            try:
+                _ = self.whisper_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.whisper_queue.put_nowait(STOP_TOKEN)
+            except queue.Full:
+                pass
+
     def clear_stream_queue(self) -> None:
         while True:
             try:
                 _ = self.stream_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def clear_whisper_queue(self) -> None:
+        while True:
+            try:
+                _ = self.whisper_queue.get_nowait()
             except queue.Empty:
                 break
 
@@ -1205,6 +1271,9 @@ class ClientSession:
             "hesitation_filter_hits": self.hesitation_filter_hits,
             "cpu_load_ratio": round(max(0.0, self.cpu_load_ratio), 3),
             "cpu_guard_active": self.cpu_guard_active,
+            "whisper_processing_delay_ms": round(max(0.0, self.whisper_avg_processing_delay_ms), 2),
+            "final_flush_duration_ms": round(max(0.0, self.whisper_final_flush_duration_ms), 2),
+            "whisper_queue_size_peak_limit": WHISPER_QUEUE_MAX_SIZE,
         }
 
     def _persist_session_metrics(self, final_text: str) -> None:
@@ -1213,6 +1282,234 @@ class ClientSession:
                 return
             record = self._build_session_metrics_record_locked(final_text)
         append_session_metrics(record)
+
+    def _trim_processed_audio_locked(self) -> None:
+        if not self.audio_buffer_bytes:
+            self.whisper_processed_offset_bytes = 0
+            return
+
+        keep_tail_bytes = SAMPLE_RATE * 2 * 6
+        trim_candidate = self.whisper_processed_offset_bytes - keep_tail_bytes
+        if trim_candidate <= 0:
+            return
+
+        trim_bytes = trim_candidate - (trim_candidate % 2)
+        if trim_bytes <= 0:
+            return
+
+        del self.audio_buffer_bytes[:trim_bytes]
+        self.whisper_processed_offset_bytes = max(0, self.whisper_processed_offset_bytes - trim_bytes)
+
+    def _whisper_queue_size_locked(self) -> int:
+        with self.whisper_queue.mutex:
+            return sum(1 for item in self.whisper_queue.queue if isinstance(item, dict))
+
+    def _drop_oldest_whisper_segment_locked(self) -> bool:
+        with self.whisper_queue.mutex:
+            queued_items = self.whisper_queue.queue
+            for index, queued_item in enumerate(queued_items):
+                if isinstance(queued_item, dict):
+                    del queued_items[index]
+                    return True
+        return False
+
+    def _queue_whisper_item_locked(self, payload: Dict, priority: bool = False) -> bool:
+        if priority:
+            # Keep at most one queued segment ahead of a priority chunk.
+            while self._whisper_queue_size_locked() > 1:
+                if not self._drop_oldest_whisper_segment_locked():
+                    break
+
+        while self._whisper_queue_size_locked() >= WHISPER_QUEUE_MAX_SIZE:
+            if not self._drop_oldest_whisper_segment_locked():
+                break
+
+        try:
+            self.whisper_queue.put_nowait(payload)
+            return True
+        except queue.Full:
+            if self._drop_oldest_whisper_segment_locked():
+                try:
+                    self.whisper_queue.put_nowait(payload)
+                    return True
+                except queue.Full:
+                    return False
+            return False
+
+    def _compute_dynamic_whisper_segment_seconds_locked(self) -> float:
+        lower = min(WHISPER_MIN_SEGMENT_SECONDS, WHISPER_MAX_SEGMENT_SECONDS)
+        upper = max(WHISPER_MIN_SEGMENT_SECONDS, WHISPER_MAX_SEGMENT_SECONDS)
+        segment_seconds = (lower + upper) / 2.0
+
+        if self.speech_words_per_second >= ADAPTIVE_FAST_SPEECH_WPS:
+            segment_seconds = lower
+        elif self.speech_words_per_second <= ADAPTIVE_SLOW_SPEECH_WPS:
+            segment_seconds = min(upper, lower + 0.45)
+
+        queue_size = self._whisper_queue_size_locked()
+        if queue_size >= max(1, WHISPER_QUEUE_MAX_SIZE - 1):
+            segment_seconds = min(upper, segment_seconds + 0.25)
+        if self.cpu_guard_active:
+            segment_seconds = min(upper, segment_seconds + 0.2)
+        return clamp_float(segment_seconds, lower, upper)
+
+    def _enqueue_whisper_segments_locked(self, force: bool = False, priority: bool = False) -> int:
+        if WHISPER_MODEL is None:
+            return 0
+
+        bytes_per_second = SAMPLE_RATE * 2
+        lower_seconds = min(WHISPER_MIN_SEGMENT_SECONDS, WHISPER_MAX_SEGMENT_SECONDS)
+        upper_seconds = max(WHISPER_MIN_SEGMENT_SECONDS, WHISPER_MAX_SEGMENT_SECONDS)
+        max_chunk_bytes = int(upper_seconds * bytes_per_second)
+        micro_batch_bytes = int(WHISPER_MICRO_BATCH_MIN_SECONDS * bytes_per_second)
+        enqueued = 0
+
+        while True:
+            available_bytes = len(self.audio_buffer_bytes) - self.whisper_processed_offset_bytes
+            if available_bytes <= 0:
+                break
+
+            dynamic_seconds = self._compute_dynamic_whisper_segment_seconds_locked()
+            target_chunk_bytes = int(dynamic_seconds * bytes_per_second)
+            target_chunk_bytes = max(int(lower_seconds * bytes_per_second), target_chunk_bytes)
+            target_chunk_bytes = min(max_chunk_bytes, target_chunk_bytes)
+
+            now = time.monotonic()
+            stale_wait = (now - self.whisper_last_enqueue_timestamp) * 1000.0 >= 650.0
+            if not force and available_bytes < micro_batch_bytes and not stale_wait:
+                break
+
+            next_chunk_bytes = min(max_chunk_bytes, available_bytes)
+            if force and available_bytes < target_chunk_bytes:
+                next_chunk_bytes = available_bytes
+            elif not force and available_bytes < target_chunk_bytes and not stale_wait:
+                break
+            elif not force:
+                next_chunk_bytes = min(next_chunk_bytes, target_chunk_bytes)
+
+            next_chunk_bytes -= next_chunk_bytes % 2
+            if next_chunk_bytes <= 0:
+                break
+
+            start = self.whisper_processed_offset_bytes
+            end = start + next_chunk_bytes
+            audio_slice = bytes(self.audio_buffer_bytes[start:end])
+            if len(audio_slice) < 2:
+                break
+
+            try:
+                queued = self._queue_whisper_item_locked(
+                    {
+                        "audio_bytes": audio_slice,
+                        "force": force,
+                        "priority": priority,
+                        "epoch": self.session_epoch,
+                        "enqueue_ts": now,
+                        "segment_seconds": round(len(audio_slice) / bytes_per_second, 3),
+                    },
+                    priority=priority,
+                )
+            except Exception:
+                queued = False
+
+            if not queued:
+                break
+
+            self.whisper_processed_offset_bytes = end
+            self.whisper_segment_count += 1
+            enqueued += 1
+            self.whisper_last_enqueue_timestamp = now
+
+            if priority:
+                break
+
+            if not force:
+                break
+
+        self._trim_processed_audio_locked()
+        return enqueued
+
+    def _wait_for_whisper_drain(self, timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + max(0.1, timeout_seconds)
+        while not self.closed.is_set() and time.monotonic() < deadline:
+            with self.state_lock:
+                drained = self._whisper_queue_size_locked() == 0 and self.whisper_active_jobs == 0
+            if drained:
+                return True
+            time.sleep(0.05)
+        with self.state_lock:
+            return self._whisper_queue_size_locked() == 0 and self.whisper_active_jobs == 0
+
+    def _combined_incremental_final_text(self) -> str:
+        with self.state_lock:
+            return normalize_spaces(self.whisper_final_text)
+
+    def emit_processing_debug_event(self, force: bool = False) -> None:
+        message = ""
+        with self.state_lock:
+            now = time.monotonic()
+            if (
+                not force
+                and self.whisper_last_debug_emit_timestamp > 0.0
+                and (now - self.whisper_last_debug_emit_timestamp) * 1000.0 < WHISPER_DEBUG_EMIT_INTERVAL_MS
+            ):
+                return
+
+            self.whisper_last_debug_emit_timestamp = now
+            payload = {
+                "queue_size": self._whisper_queue_size_locked(),
+                "processing_delay_ms": round(max(0.0, self.whisper_avg_processing_delay_ms), 1),
+                "final_flush_duration_ms": round(max(0.0, self.whisper_final_flush_duration_ms), 1),
+                "beam_size": int(self.whisper_dynamic_beam_size),
+                "active_jobs": int(self.whisper_active_jobs),
+            }
+            message = f"debug:{json.dumps(payload, separators=(',', ':'))}"
+
+        self.send_event({"type": "processing", "status": message})
+
+    def _emit_refined_progress_event(self, force: bool = False) -> None:
+        event: Optional[Dict] = None
+        with self.state_lock:
+            if not self.is_finalizing:
+                return
+            now = time.monotonic()
+            if (
+                not force
+                and self.whisper_last_progress_emit_timestamp > 0.0
+                and (now - self.whisper_last_progress_emit_timestamp) * 1000.0 < WHISPER_PROGRESS_EMIT_INTERVAL_MS
+            ):
+                return
+
+            refined_text = normalize_spaces(self.whisper_final_text)
+            if not refined_text:
+                return
+
+            self.whisper_last_progress_emit_timestamp = now
+            event = {
+                "type": "partial",
+                "text": refined_text,
+                "stable": refined_text,
+                "partial": "",
+                "partial_confidences": [],
+                "stability_level": 3,
+                "speech_wps": round(self.speech_words_per_second, 3),
+                "emit_interval_ms": self.dynamic_emit_interval_ms,
+                "rms": round(self.last_audio_rms, 4),
+                "silence_ms": int(max(0.0, (now - self.last_speech_timestamp) * 1000.0)),
+                "thinking": True,
+                "prediction": "",
+                "calibrated": self.calibration_done,
+                "calibration_progress": 1.0,
+                "confidence_baseline": round(self.calibrated_first_confidence, 3),
+                "hesitation_filtered": False,
+                "correction_rate": round(self.feedback_correction_rate, 3),
+                "avg_latency_ms": round(self.feedback_avg_latency_ms, 1),
+                "cpu_load_ratio": round(self.cpu_load_ratio, 3),
+                "cpu_guard": self.cpu_guard_active,
+            }
+
+        if event:
+            self.send_event(event)
 
     def _build_session_phrase_grammar_locked(self) -> Optional[str]:
         terms: List[str] = list(PHRASE_BIAS_TERMS)
@@ -1449,6 +1746,13 @@ class ClientSession:
             if self.low_conf_hold_since[key] <= stale_cutoff:
                 del self.low_conf_hold_since[key]
 
+        if not visible_words and words:
+            # Never hide all live text; keep one low-confidence token visible.
+            fallback_index = max(0, len(words) - 1)
+            fallback_conf = confidences[fallback_index] if fallback_index < len(confidences) else PARTIAL_MIN_CONFIDENCE
+            visible_words = [words[fallback_index]]
+            visible_confidences = [clamp_float(fallback_conf, 0.0, 1.0)]
+
         return visible_words, visible_confidences
 
     def _predict_partial_extension_locked(self, words: List[str], confidences: List[float]) -> str:
@@ -1612,10 +1916,8 @@ class ClientSession:
                 next_streaks.append(streak)
                 confidence_samples.append(conf)
 
-                # Keep slightly-below-threshold candidates for short holding, but
-                # stop on clearly unreliable tails.
-                if conf + 0.08 < threshold:
-                    break
+                if conf + 0.12 < threshold and streak <= 1:
+                    continue
 
                 output.append((word, conf))
 
@@ -1764,6 +2066,7 @@ class ClientSession:
             self.pause_commit_done = True
             self._register_confirmed_words_locked(words, time.monotonic())
             self.clear_partial_stabilization_state()
+            self._enqueue_whisper_segments_locked(force=False)
             return True
 
     def maybe_append_pause_punctuation(self, silence_for_ms: float) -> None:
@@ -1938,6 +2241,144 @@ class ClientSession:
                 "cpu_guard": cpu_guard,
             }
         )
+        self.emit_processing_debug_event(force=False)
+
+    def whisper_worker_loop(self) -> None:
+        while not self.closed.is_set():
+            try:
+                item = self.whisper_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if item is STOP_TOKEN:
+                if self.closed.is_set():
+                    break
+                continue
+
+            if not isinstance(item, dict):
+                continue
+
+            audio_bytes = item.get("audio_bytes", b"")
+            if not isinstance(audio_bytes, (bytes, bytearray)) or len(audio_bytes) < 2:
+                continue
+            item_epoch = int(item.get("epoch", -1))
+            item_priority = bool(item.get("priority", False))
+            enqueue_ts = float(item.get("enqueue_ts", time.monotonic()))
+
+            # Micro-batch tiny chunks to reduce per-call Whisper overhead.
+            bytes_per_second = SAMPLE_RATE * 2
+            min_batch_bytes = int(WHISPER_MICRO_BATCH_MIN_SECONDS * bytes_per_second)
+            max_batch_bytes = int(min(3.0, max(WHISPER_MIN_SEGMENT_SECONDS, WHISPER_MAX_SEGMENT_SECONDS)) * bytes_per_second)
+            if not item_priority and len(audio_bytes) < min_batch_bytes:
+                merged_parts: List[bytes] = [bytes(audio_bytes)]
+                deferred_items: List[object] = []
+                merged_bytes = len(audio_bytes)
+                while merged_bytes < min_batch_bytes and merged_bytes < max_batch_bytes:
+                    try:
+                        next_item = self.whisper_queue.get_nowait()
+                    except queue.Empty:
+                        break
+
+                    if not isinstance(next_item, dict):
+                        deferred_items.append(next_item)
+                        continue
+                    if int(next_item.get("epoch", -1)) != item_epoch or bool(next_item.get("priority", False)):
+                        deferred_items.append(next_item)
+                        continue
+
+                    next_audio = next_item.get("audio_bytes", b"")
+                    if not isinstance(next_audio, (bytes, bytearray)) or len(next_audio) < 2:
+                        continue
+
+                    merged_parts.append(bytes(next_audio))
+                    merged_bytes += len(next_audio)
+
+                for deferred in deferred_items:
+                    try:
+                        self.whisper_queue.put_nowait(deferred)
+                    except queue.Full:
+                        break
+
+                audio_bytes = b"".join(merged_parts)[:max_batch_bytes]
+                audio_bytes = audio_bytes[: len(audio_bytes) - (len(audio_bytes) % 2)]
+                if len(audio_bytes) < 2:
+                    continue
+
+            with self.state_lock:
+                if item_epoch != self.session_epoch:
+                    continue
+
+            with self.state_lock:
+                self.whisper_active_jobs += 1
+
+            chunk_text = ""
+            try:
+                whisper_model = WHISPER_MODEL
+                if whisper_model is None:
+                    continue
+
+                int16_audio = np.frombuffer(audio_bytes, dtype=np.int16)
+                if int16_audio.size == 0:
+                    continue
+
+                with self.state_lock:
+                    queue_depth = self._whisper_queue_size_locked()
+                    dynamic_beam = WHISPER_BEAM_SIZE
+                    if (
+                        self.cpu_guard_active
+                        or queue_depth >= max(1, WHISPER_QUEUE_MAX_SIZE - 1)
+                        or self.whisper_avg_processing_delay_ms >= 1300.0
+                    ):
+                        dynamic_beam = 1
+                    self.whisper_dynamic_beam_size = dynamic_beam
+
+                audio_float = int16_audio.astype(np.float32) / 32768.0
+                with WHISPER_LOCK:
+                    segments, _ = whisper_model.transcribe(
+                        audio_float,
+                        language="en",
+                        beam_size=dynamic_beam,
+                        best_of=1 if dynamic_beam <= 1 else WHISPER_BEST_OF,
+                        vad_filter=True,
+                        temperature=0.0,
+                        condition_on_previous_text=True,
+                    )
+
+                kept_segments: List[str] = []
+                for segment in segments:
+                    segment_text = str(segment.text or "").strip()
+                    if not segment_text:
+                        continue
+                    avg_logprob = getattr(segment, "avg_logprob", None)
+                    if avg_logprob is not None and float(avg_logprob) < WHISPER_LOW_CONFIDENCE_LOGPROB:
+                        continue
+                    kept_segments.append(segment_text)
+
+                chunk_text = normalize_spaces(" ".join(kept_segments))
+            except Exception as exc:
+                self.send_event({"type": "error", "message": f"Incremental Whisper failed: {exc}"})
+            finally:
+                with self.state_lock:
+                    self.whisper_active_jobs = max(0, self.whisper_active_jobs - 1)
+                    processing_delay_ms = max(0.0, (time.monotonic() - enqueue_ts) * 1000.0)
+                    self.whisper_last_processing_delay_ms = processing_delay_ms
+                    self.whisper_avg_processing_delay_ms = (
+                        self.whisper_avg_processing_delay_ms * 0.7 + processing_delay_ms * 0.3
+                        if self.whisper_avg_processing_delay_ms > 0.0
+                        else processing_delay_ms
+                    )
+
+            if not chunk_text:
+                self.emit_processing_debug_event(force=False)
+                continue
+
+            with self.state_lock:
+                if item_epoch != self.session_epoch:
+                    continue
+                cleaned_chunk = self._apply_learned_replacements_locked(chunk_text)
+                self.whisper_final_text = merge_text_with_overlap(self.whisper_final_text, cleaned_chunk)
+            self._emit_refined_progress_event(force=False)
+            self.emit_processing_debug_event(force=False)
 
     def flush_vosk_final(self) -> None:
         with self.state_lock:
@@ -1951,10 +2392,11 @@ class ClientSession:
         final_text = extract_confident_vosk_text(final_result)
         with self.state_lock:
             final_text = self._apply_learned_replacements_locked(final_text)
-        self.append_stable_text(final_text)
+        # self.append_stable_text(final_text)
         with self.state_lock:
             self._register_confirmed_words_locked(count_words(final_text), time.monotonic())
             self.clear_partial_stabilization_state()
+            self._enqueue_whisper_segments_locked(force=False)
         self.set_partial_text("", now=time.monotonic())
         self.emit_partial_state(force=True)
         self.stream_flushed.set()
@@ -1974,6 +2416,19 @@ class ClientSession:
     def reset_session_text(self) -> None:
         now = time.monotonic()
         with self.state_lock:
+            self.clear_whisper_queue()
+            self.audio_buffer_bytes.clear()
+            self.whisper_processed_offset_bytes = 0
+            self.whisper_active_jobs = 0
+            self.whisper_final_text = ""
+            self.whisper_segment_count = 0
+            self.whisper_last_enqueue_timestamp = 0.0
+            self.whisper_last_progress_emit_timestamp = 0.0
+            self.whisper_last_debug_emit_timestamp = 0.0
+            self.whisper_avg_processing_delay_ms = 0.0
+            self.whisper_last_processing_delay_ms = 0.0
+            self.whisper_dynamic_beam_size = WHISPER_BEAM_SIZE
+            self.whisper_final_flush_duration_ms = 0.0
             self.stable_text = ""
             self.partial_text = ""
             self.partial_confidences = []
@@ -1987,6 +2442,7 @@ class ClientSession:
             self.last_audio_rms = 0.0
             self.empty_partial_streak = 0
             self.pause_commit_done = False
+            self.is_finalizing = False
             self.clear_partial_stabilization_state()
             self.word_rate_events.clear()
             self.speech_words_per_second = 0.0
@@ -2061,10 +2517,11 @@ class ClientSession:
                 stable_piece = extract_confident_vosk_text(result)
                 with self.state_lock:
                     stable_piece = self._apply_learned_replacements_locked(stable_piece)
-                self.append_stable_text(stable_piece)
+                # self.append_stable_text(stable_piece)
                 with self.state_lock:
                     self._register_confirmed_words_locked(count_words(stable_piece), time.monotonic())
                     self.clear_partial_stabilization_state()
+                    self._enqueue_whisper_segments_locked(force=False)
                 self.set_partial_text("", now=time.monotonic())
                 self.emit_partial_state(force=True)
                 continue
@@ -2087,76 +2544,53 @@ class ClientSession:
 
             self.stream_flushed.wait(timeout=1.0)
             self.stream_flushed.clear()
-
-            audio_bytes = self.consume_audio()
             stable_text = self.get_stable_text()
 
-            if not audio_bytes:
-                with self.state_lock:
-                    stable_display = self._apply_learned_replacements_locked(stable_text)
-                final_fallback_text = post_process_text(stable_display)
-                self._learn_from_final(stable_text, final_fallback_text)
-                self.send_event({"type": "final", "text": final_fallback_text})
-                self._persist_personal_dictionary_if_needed()
-                self._persist_session_metrics(final_fallback_text)
-                self.reset_session_text()
-                continue
-
-            int16_audio = np.frombuffer(audio_bytes, dtype=np.int16)
-            if int16_audio.size == 0:
-                with self.state_lock:
-                    stable_display = self._apply_learned_replacements_locked(stable_text)
-                final_fallback_text = post_process_text(stable_display)
-                self._learn_from_final(stable_text, final_fallback_text)
-                self.send_event({"type": "final", "text": final_fallback_text})
-                self._persist_personal_dictionary_if_needed()
-                self._persist_session_metrics(final_fallback_text)
-                self.reset_session_text()
-                continue
-
-            audio_float = int16_audio.astype(np.float32) / 32768.0
-            whisper_model = WHISPER_MODEL
-            if whisper_model is None:
-                self.send_event(
-                    {
-                        "type": "error",
-                        "message": "Whisper model is unavailable. Returning stabilized transcript.",
-                    }
-                )
-                with self.state_lock:
-                    stable_display = self._apply_learned_replacements_locked(stable_text)
-                final_fallback_text = post_process_text(stable_display)
-                self._learn_from_final(stable_text, final_fallback_text)
-                self.send_event({"type": "final", "text": final_fallback_text})
-                self._persist_personal_dictionary_if_needed()
-                self._persist_session_metrics(final_fallback_text)
-                self.reset_session_text()
-                continue
-
             try:
-                with WHISPER_LOCK:
-                    segments, _ = whisper_model.transcribe(
-                        audio_float,
-                        language="en",
-                        beam_size=5,
-                        vad_filter=True,
-                        temperature=0.0,
-                        condition_on_previous_text=False,
-                    )
-                final_text = " ".join(
-                    segment.text.strip() for segment in segments if segment.text and segment.text.strip()
-                )
-                if not final_text:
-                    final_text = stable_text
+                flush_started_at = time.monotonic()
+                tail_bytes_limit = int(WHISPER_FINAL_TAIL_SECONDS * SAMPLE_RATE * 2)
                 with self.state_lock:
-                    final_text = self._apply_learned_replacements_locked(final_text)
-                final_text = post_process_text(final_text)
+                    remaining_bytes = len(self.audio_buffer_bytes) - self.whisper_processed_offset_bytes
+                    if remaining_bytes > tail_bytes_limit > 0:
+                        new_offset = len(self.audio_buffer_bytes) - tail_bytes_limit
+                        new_offset -= new_offset % 2
+                        self.whisper_processed_offset_bytes = max(0, new_offset)
+                    self._enqueue_whisper_segments_locked(force=True, priority=True)
+
+                self.send_event({"type": "processing", "status": "refining"})
+                with self.state_lock:
+                    self.is_finalizing = True
+
+                flush_deadline = time.monotonic() + WHISPER_FINAL_FLUSH_TIMEOUT_SECONDS
+                while time.monotonic() < flush_deadline:
+                    drained = self._wait_for_whisper_drain(0.14)
+                    self._emit_refined_progress_event(force=False)
+                    self.emit_processing_debug_event(force=True)
+                    if drained:
+                        break
+                    with self.state_lock:
+                        self._enqueue_whisper_segments_locked(force=True, priority=False)
+
+                with self.state_lock:
+                    self.whisper_final_flush_duration_ms = max(0.0, (time.monotonic() - flush_started_at) * 1000.0)
+                self.emit_processing_debug_event(force=True)
+                self._emit_refined_progress_event(force=True)
+
+                final_candidate = self._combined_incremental_final_text()
+                if not final_candidate:
+                    with self.state_lock:
+                        final_candidate = self._apply_learned_replacements_locked(stable_text)
+
+                final_text = post_process_text(final_candidate)
+                if not final_text:
+                    final_text = post_process_text(stable_text)
+
                 self._learn_from_final(stable_text, final_text)
                 self.send_event({"type": "final", "text": final_text})
                 self._persist_personal_dictionary_if_needed()
                 self._persist_session_metrics(final_text)
             except Exception as exc:
-                self.send_event({"type": "error", "message": f"Whisper failed: {exc}"})
+                self.send_event({"type": "error", "message": f"Finalization failed: {exc}"})
                 self._persist_session_metrics(stable_text)
             finally:
                 self.reset_session_text()

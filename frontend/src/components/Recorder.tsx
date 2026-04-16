@@ -5,10 +5,10 @@ import { AnimatePresence, motion } from "framer-motion";
 import { Check, Copy } from "lucide-react";
 import { RealtimeSocket, type ServerMessage } from "@/lib/websocket";
 
-const DEFAULT_CHUNK_MS = 25;
+const DEFAULT_CHUNK_MS = 250;
 const MIN_CHUNK_MS = 20;
 const MAX_CHUNK_MS = 30;
-const UI_BATCH_DELAY_MS = 50;
+const UI_BATCH_DELAY_MS = 100;
 const FINAL_CORRECTION_HIGHLIGHT_MS = 1200;
 const WORD_STAGGER_MS = 50;
 const DEBUG_HESITATION_FLASH_MS = 1200;
@@ -183,6 +183,35 @@ function metricTone(
     return "text-emerald-300";
 }
 
+function parseProcessingDebugStatus(status: string): {
+    queueSize?: number;
+    processingDelayMs?: number;
+    finalFlushDurationMs?: number;
+    beamSize?: number;
+    activeJobs?: number;
+} | null {
+    if (!status.startsWith("debug:")) {
+        return null;
+    }
+    try {
+        const payload = JSON.parse(status.slice(6)) as Record<string, unknown>;
+        const queueSize = Number(payload.queue_size);
+        const processingDelayMs = Number(payload.processing_delay_ms);
+        const finalFlushDurationMs = Number(payload.final_flush_duration_ms);
+        const beamSize = Number(payload.beam_size);
+        const activeJobs = Number(payload.active_jobs);
+        return {
+            queueSize: Number.isFinite(queueSize) ? queueSize : undefined,
+            processingDelayMs: Number.isFinite(processingDelayMs) ? processingDelayMs : undefined,
+            finalFlushDurationMs: Number.isFinite(finalFlushDurationMs) ? finalFlushDurationMs : undefined,
+            beamSize: Number.isFinite(beamSize) ? beamSize : undefined,
+            activeJobs: Number.isFinite(activeJobs) ? activeJobs : undefined,
+        };
+    } catch {
+        return null;
+    }
+}
+
 export default function Recorder() {
     const socketRef = useRef<RealtimeSocket | null>(null);
     const recorderRef = useRef<MediaRecorder | null>(null);
@@ -207,6 +236,8 @@ export default function Recorder() {
     const lastPartialArrivalRef = useRef(0);
     const partialEventCountRef = useRef(0);
     const partialRewriteCountRef = useRef(0);
+    const finalLockedRef = useRef(false);
+    const processingStartedAtRef = useRef<number | null>(null);
 
     const [isRecording, setIsRecording] = useState(false);
     const [stableText, setStableText] = useState("");
@@ -235,6 +266,12 @@ export default function Recorder() {
     const [perceivedLatencyMs, setPerceivedLatencyMs] = useState(0);
     const [hesitationFilterTriggered, setHesitationFilterTriggered] = useState(false);
     const [debugVisible, setDebugVisible] = useState(false);
+    const [whisperQueueSize, setWhisperQueueSize] = useState(0);
+    const [whisperProcessingDelayMs, setWhisperProcessingDelayMs] = useState(0);
+    const [finalFlushDurationMs, setFinalFlushDurationMs] = useState(0);
+    const [whisperBeamSize, setWhisperBeamSize] = useState(2);
+    const [whisperActiveJobs, setWhisperActiveJobs] = useState(0);
+    const [processingProgress, setProcessingProgress] = useState(0);
 
     useEffect(() => {
         isRecordingRef.current = isRecording;
@@ -250,6 +287,26 @@ export default function Recorder() {
         window.addEventListener("keydown", onKeyDown);
         return () => window.removeEventListener("keydown", onKeyDown);
     }, []);
+
+    useEffect(() => {
+        if (status !== "processing") {
+            processingStartedAtRef.current = null;
+            return;
+        }
+
+        if (processingStartedAtRef.current === null) {
+            processingStartedAtRef.current = Date.now();
+        }
+
+        const timer = window.setInterval(() => {
+            const startedAt = processingStartedAtRef.current ?? Date.now();
+            const elapsedMs = Date.now() - startedAt;
+            const target = Math.min(94, 12 + elapsedMs / 42);
+            setProcessingProgress((previous) => (previous < target ? previous * 0.72 + target * 0.28 : previous));
+        }, 90);
+
+        return () => window.clearInterval(timer);
+    }, [status]);
 
     const teardownEnergyMonitor = useCallback(() => {
         if (energyMonitorRef.current !== null) {
@@ -356,7 +413,7 @@ export default function Recorder() {
 
     const stopRecorderOnly = useCallback(() => {
         if (recorderRef.current?.state !== "inactive") {
-            recorderRef.current.stop();
+            recorderRef.current?.stop();
         }
         recorderRef.current = null;
     }, []);
@@ -399,9 +456,17 @@ export default function Recorder() {
         setCorrectionRate(0);
         setPerceivedLatencyMs(0);
         setHesitationFilterTriggered(false);
+        setWhisperQueueSize(0);
+        setWhisperProcessingDelayMs(0);
+        setFinalFlushDurationMs(0);
+        setWhisperBeamSize(2);
+        setWhisperActiveJobs(0);
+        setProcessingProgress(0);
         lastPartialArrivalRef.current = 0;
         partialEventCountRef.current = 0;
         partialRewriteCountRef.current = 0;
+        finalLockedRef.current = false;
+        processingStartedAtRef.current = null;
     }, []);
 
     const addButtonRipple = useCallback((event: MouseEvent<HTMLButtonElement>) => {
@@ -430,6 +495,9 @@ export default function Recorder() {
         }
 
         if (pending.partial && !pending.final) {
+            if (finalLockedRef.current && !isRecordingRef.current) {
+                return;
+            }
             const previousPartial = partialRef.current;
             const smoothed = smoothPartialTail(
                 previousPartial,
@@ -504,6 +572,8 @@ export default function Recorder() {
             const changedIndexes = computeChangedWordIndexes(liveBeforeFinal, nextFinalText);
             const majorCorrection = shouldHighlightCorrections(liveBeforeFinal, nextFinalText, changedIndexes);
             const finalDiff = wordDiffRatio(liveBeforeFinal, nextFinalText);
+            finalLockedRef.current = true;
+            processingStartedAtRef.current = null;
 
             finalRef.current = nextFinalText;
             stableRef.current = nextFinalText;
@@ -521,6 +591,7 @@ export default function Recorder() {
             setIsThinking(false);
             setSilenceMs(0);
             setCalibrationProgress(1);
+            setProcessingProgress(100);
 
             if (correctionTimerRef.current !== null) {
                 window.clearTimeout(correctionTimerRef.current);
@@ -548,6 +619,9 @@ export default function Recorder() {
         (message: ServerMessage) => {
             switch (message.type) {
                 case "partial":
+                    if (finalLockedRef.current && !isRecordingRef.current) {
+                        return;
+                    }
                     pendingRef.current.partial = message;
                     break;
                 case "final":
@@ -555,6 +629,37 @@ export default function Recorder() {
                     break;
                 case "status":
                     pendingRef.current.status = message.state || "unknown";
+                    break;
+                case "processing":
+                    if (typeof message.status === "string") {
+                        const debugPayload = parseProcessingDebugStatus(message.status);
+                        if (debugPayload) {
+                            if (debugPayload.queueSize !== undefined) {
+                                setWhisperQueueSize(debugPayload.queueSize);
+                            }
+                            if (debugPayload.processingDelayMs !== undefined) {
+                                setWhisperProcessingDelayMs(debugPayload.processingDelayMs);
+                            }
+                            if (debugPayload.finalFlushDurationMs !== undefined) {
+                                setFinalFlushDurationMs(debugPayload.finalFlushDurationMs);
+                                if (debugPayload.finalFlushDurationMs > 0) {
+                                    setProcessingProgress((previous) => Math.max(previous, 92));
+                                }
+                            }
+                            if (debugPayload.beamSize !== undefined) {
+                                setWhisperBeamSize(debugPayload.beamSize);
+                            }
+                            if (debugPayload.activeJobs !== undefined) {
+                                setWhisperActiveJobs(debugPayload.activeJobs);
+                            }
+                            scheduleUiFlush();
+                            return;
+                        }
+                    }
+                    if (processingStartedAtRef.current === null) {
+                        processingStartedAtRef.current = Date.now();
+                    }
+                    pendingRef.current.status = "processing";
                     break;
                 case "error":
                     pendingRef.current.error = message.message;
@@ -604,6 +709,8 @@ export default function Recorder() {
         }
 
         setError("");
+        finalLockedRef.current = false;
+        processingStartedAtRef.current = null;
         setPrediction("");
         setIsThinking(false);
         setSilenceMs(0);
@@ -613,6 +720,12 @@ export default function Recorder() {
         setCorrectionRate(0);
         setPerceivedLatencyMs(0);
         setHesitationFilterTriggered(false);
+        setWhisperQueueSize(0);
+        setWhisperProcessingDelayMs(0);
+        setFinalFlushDurationMs(0);
+        setWhisperBeamSize(2);
+        setWhisperActiveJobs(0);
+        setProcessingProgress(0);
         partialEventCountRef.current = 0;
         partialRewriteCountRef.current = 0;
         lastPartialArrivalRef.current = 0;
@@ -657,6 +770,7 @@ export default function Recorder() {
         socketRef.current?.sendCommand({ type: "stop" });
         setIsRecording(false);
         setStatus("processing");
+        setProcessingProgress((previous) => Math.max(previous, 8));
         setIsThinking(false);
         setHesitationFilterTriggered(false);
         if (recorderTimerRef.current !== null) {
@@ -725,7 +839,7 @@ export default function Recorder() {
     const predictionActive = predictedTail.length > 0;
 
     const dynamicState = status === "processing"
-        ? "Refining transcript..."
+        ? "🧠 Finalizing transcript..."
         : isRecording
             ? !isCalibrated
                 ? `Calibrating voice profile... ${Math.min(99, calibrationPercent)}%`
@@ -844,11 +958,10 @@ export default function Recorder() {
                                     onClick={handlePrimaryAction}
                                     whileHover={{ scale: 1.015 }}
                                     whileTap={{ scale: 0.985 }}
-                                    className={`relative mt-6 w-full overflow-hidden rounded-2xl px-5 py-3 font-medium tracking-wide transition ${
-                                        isRecording
-                                            ? "border border-red-400/60 text-red-200 bg-red-500/10"
-                                            : "text-black bg-gradient-to-r from-cyan-300 to-blue-400"
-                                    }`}
+                                    className={`relative mt-6 w-full overflow-hidden rounded-2xl px-5 py-3 font-medium tracking-wide transition ${isRecording
+                                        ? "border border-red-400/60 text-red-200 bg-red-500/10"
+                                        : "text-black bg-gradient-to-r from-cyan-300 to-blue-400"
+                                        }`}
                                 >
                                     {ripples.map((ripple) => (
                                         <span
@@ -984,6 +1097,31 @@ export default function Recorder() {
                                                         ...
                                                     </motion.span>
                                                 ) : null}
+                                                {status === "processing" ? (
+                                                    <span className="ml-3 inline-flex flex-col gap-1 align-middle min-w-[220px]">
+                                                        <motion.span
+                                                            initial={{ opacity: 0 }}
+                                                            animate={{ opacity: 1 }}
+                                                            className="inline-flex items-center gap-2 text-cyan-200/80 text-sm"
+                                                        >
+                                                            <motion.span
+                                                                animate={{ rotate: 360 }}
+                                                                transition={{ repeat: Infinity, duration: 0.9, ease: "linear" }}
+                                                                className="inline-block"
+                                                            >
+                                                                ◌
+                                                            </motion.span>
+                                                            Finalizing transcript... {Math.min(99, Math.round(processingProgress))}%
+                                                        </motion.span>
+                                                        <span className="h-1.5 w-full rounded-full bg-white/10 overflow-hidden">
+                                                            <motion.span
+                                                                className="h-full block rounded-full bg-gradient-to-r from-cyan-300/70 to-blue-300/75"
+                                                                animate={{ width: `${Math.max(8, Math.min(100, processingProgress))}%` }}
+                                                                transition={{ duration: 0.18, ease: "easeOut" }}
+                                                            />
+                                                        </span>
+                                                    </span>
+                                                ) : null}
                                             </motion.div>
                                         )}
                                     </AnimatePresence>
@@ -1041,6 +1179,20 @@ export default function Recorder() {
                                 <p className={metricTone(emitIntervalMs, 140, 190, true)}>Emit Interval: {emitIntervalMs} ms</p>
                                 <p className={metricTone(perceivedLatencyMs || emitIntervalMs + UI_BATCH_DELAY_MS, 150, 230, true)}>
                                     Perceived Latency: {(perceivedLatencyMs || emitIntervalMs + UI_BATCH_DELAY_MS).toFixed(1)} ms
+                                </p>
+                            </div>
+
+                            <div className="rounded-lg border border-white/10 bg-black/20 p-2.5">
+                                <p className="text-white/50 uppercase tracking-[0.12em] text-[10px] mb-1">Whisper</p>
+                                <p className={metricTone(whisperQueueSize, 2, 3, true)}>Queue Size: {whisperQueueSize}</p>
+                                <p className={metricTone(whisperProcessingDelayMs, 900, 1500, true)}>
+                                    Processing Delay: {whisperProcessingDelayMs.toFixed(1)} ms
+                                </p>
+                                <p className={metricTone(finalFlushDurationMs || processingProgress * 20, 1500, 2500, true)}>
+                                    Final Flush: {(finalFlushDurationMs || 0).toFixed(1)} ms
+                                </p>
+                                <p className={whisperBeamSize <= 1 ? "text-amber-300" : "text-emerald-300"}>
+                                    Beam Size: {whisperBeamSize} | Active Jobs: {whisperActiveJobs}
                                 </p>
                             </div>
 
