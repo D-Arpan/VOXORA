@@ -8,7 +8,9 @@
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
     "python": ".\\.venv\\Scripts\\python.exe python/transcriber_server.py",
-    "dev:all": "concurrently --names \"PY,BACKEND,FRONTEND\" --prefix-colors \"blue,green,yellow\" \"npm run python\" \"npm run dev\" \"cd ../frontend && npm run dev\""
+    "dev:all": "concurrently --names \"BACKEND,PY,FRONTEND\" --prefix-colors \"green,blue,yellow\" \"npm run dev\" \"npm run python:wait\" \"npm run frontend:wait\"",
+    "python:wait": "wait-on tcp:5000 && npm run python",
+    "frontend:wait": "wait-on tcp:6000 && cd ../frontend && npm run dev"
   },
   "keywords": [],
   "author": "",
@@ -23,6 +25,7 @@
   },
   "devDependencies": {
     "concurrently": "^9.2.1",
-    "nodemon": "^3.1.14"
+    "nodemon": "^3.1.14",
+    "wait-on": "^9.1.0"
   }
 }

@@ -156,19 +156,43 @@ export class RealtimeSocket {
     }
 
     connect(): void {
-        if (this.socket && (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)) {
+        if (this.socket && (
+            this.socket.readyState === WebSocket.OPEN ||
+            this.socket.readyState === WebSocket.CONNECTING
+        )) {
             return;
         }
 
         const ws = new WebSocket(this.wsUrl);
         ws.binaryType = "arraybuffer";
 
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
+
+        const attemptReconnect = () => {
+            if (reconnectAttempts >= maxReconnectAttempts) {
+                this.handlers.onError?.("WebSocket reconnection failed");
+                return;
+            }
+
+            reconnectAttempts++;
+            setTimeout(() => {
+                this.connect();
+            }, 500 * reconnectAttempts);
+        };
+
         ws.onopen = () => {
+            reconnectAttempts = 0;
+            this.socket = ws; // ✅ assign ONLY when stable
             this.handlers.onOpen?.();
         };
 
         ws.onclose = () => {
             this.handlers.onClose?.();
+            if (this.socket === ws) {
+                this.socket = null;
+            }
+            attemptReconnect();
         };
 
         ws.onerror = () => {
@@ -177,16 +201,18 @@ export class RealtimeSocket {
 
         ws.onmessage = (event) => {
             if (typeof event.data !== "string") {
+                this.handlers.onError?.("Received non-text message from server");
                 return;
             }
+
             const message = parseServerMessage(event.data);
             if (!message) {
+                this.handlers.onError?.("Invalid message format from server");
                 return;
             }
+
             this.handlers.onMessage(message);
         };
-
-        this.socket = ws;
     }
 
     async waitForOpen(timeoutMs: number = 2500, pollMs: number = 25): Promise<boolean> {
@@ -223,21 +249,39 @@ export class RealtimeSocket {
     }
 
     sendAudio(arrayBuffer: ArrayBuffer): void {
-        if (!this.isOpen() || !this.socket || arrayBuffer.byteLength === 0) {
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
             return;
         }
-        this.socket.send(arrayBuffer);
+
+        if (!arrayBuffer || arrayBuffer.byteLength === 0) {
+            return;
+        }
+
+        try {
+            this.socket.send(arrayBuffer);
+        } catch (err) {
+            this.handlers.onError?.("Failed to send audio chunk");
+        }
     }
 
     close(): void {
-        if (!this.socket) {
-            return;
+        if (!this.socket) return;
+
+        try {
+            if (this.socket.readyState === WebSocket.OPEN) {
+                this.sendCommand({ type: "close" });
+            }
+
+            if (
+                this.socket.readyState === WebSocket.OPEN ||
+                this.socket.readyState === WebSocket.CONNECTING
+            ) {
+                this.socket.close();
+            }
+        } catch {
+            // ignore safely
         }
 
-        if (this.socket.readyState === WebSocket.OPEN) {
-            this.sendCommand({ type: "close" });
-        }
-        this.socket.close();
         this.socket = null;
     }
 }
