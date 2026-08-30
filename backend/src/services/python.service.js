@@ -101,7 +101,7 @@ class PythonSession extends EventEmitter {
     }
 
     handleFrame(type, payload) {
-        if (type !== FRAME_EVENT && type !== FRAME_CONTROL) {
+        if (type !== FRAME_EVENT) {
             return;
         }
 
@@ -128,7 +128,17 @@ class PythonSession extends EventEmitter {
         }
 
         const frame = buildFrame(type, payload);
-        return this.socket.write(frame);
+
+        const canWrite = this.socket.write(frame);
+
+        if (!canWrite) {
+            // Backpressure handling (optional but good)
+            this.socket.once("drain", () => {
+                // resumed
+            });
+        }
+
+        return canWrite;
     }
 
     start() {

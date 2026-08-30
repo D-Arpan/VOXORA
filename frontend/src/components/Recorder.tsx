@@ -1,14 +1,15 @@
-﻿"use client";
+"use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { Check, Copy } from "lucide-react";
+import { Check, Copy, Sun, Moon, Trash2 } from "lucide-react";
+import MouseGlitter from "./MouseGlitter";
 import { RealtimeSocket, type ServerMessage } from "@/lib/websocket";
 
-const DEFAULT_CHUNK_MS = 25;
-const MIN_CHUNK_MS = 20;
-const MAX_CHUNK_MS = 30;
-const UI_BATCH_DELAY_MS = 50;
+const DEFAULT_CHUNK_MS = 100;
+const MIN_CHUNK_MS = 60;
+const MAX_CHUNK_MS = 120;
+const UI_BATCH_DELAY_MS = 100;
 const FINAL_CORRECTION_HIGHLIGHT_MS = 1200;
 const WORD_STAGGER_MS = 50;
 const DEBUG_HESITATION_FLASH_MS = 1200;
@@ -183,7 +184,48 @@ function metricTone(
     return "text-emerald-300";
 }
 
+function parseProcessingDebugStatus(status: string): {
+    queueSize?: number;
+    processingDelayMs?: number;
+    finalFlushDurationMs?: number;
+    beamSize?: number;
+    activeJobs?: number;
+} | null {
+    if (!status.startsWith("debug:")) {
+        return null;
+    }
+    try {
+        const payload = JSON.parse(status.slice(6)) as Record<string, unknown>;
+        const queueSize = Number(payload.queue_size);
+        const processingDelayMs = Number(payload.processing_delay_ms);
+        const finalFlushDurationMs = Number(payload.final_flush_duration_ms);
+        const beamSize = Number(payload.beam_size);
+        const activeJobs = Number(payload.active_jobs);
+        return {
+            queueSize: Number.isFinite(queueSize) ? queueSize : undefined,
+            processingDelayMs: Number.isFinite(processingDelayMs) ? processingDelayMs : undefined,
+            finalFlushDurationMs: Number.isFinite(finalFlushDurationMs) ? finalFlushDurationMs : undefined,
+            beamSize: Number.isFinite(beamSize) ? beamSize : undefined,
+            activeJobs: Number.isFinite(activeJobs) ? activeJobs : undefined,
+        };
+    } catch {
+        return null;
+    }
+}
+
 export default function Recorder() {
+    const [isDarkMode, setIsDarkMode] = useState(true);
+
+    useEffect(() => {
+        if (typeof document !== 'undefined') {
+            if (isDarkMode) {
+                document.documentElement.classList.add("dark");
+            } else {
+                document.documentElement.classList.remove("dark");
+            }
+        }
+    }, [isDarkMode]);
+
     const socketRef = useRef<RealtimeSocket | null>(null);
     const recorderRef = useRef<MediaRecorder | null>(null);
     const streamRef = useRef<MediaStream | null>(null);
@@ -207,6 +249,8 @@ export default function Recorder() {
     const lastPartialArrivalRef = useRef(0);
     const partialEventCountRef = useRef(0);
     const partialRewriteCountRef = useRef(0);
+    const finalLockedRef = useRef(false);
+    const processingStartedAtRef = useRef<number | null>(null);
 
     const [isRecording, setIsRecording] = useState(false);
     const [stableText, setStableText] = useState("");
@@ -235,6 +279,12 @@ export default function Recorder() {
     const [perceivedLatencyMs, setPerceivedLatencyMs] = useState(0);
     const [hesitationFilterTriggered, setHesitationFilterTriggered] = useState(false);
     const [debugVisible, setDebugVisible] = useState(false);
+    const [whisperQueueSize, setWhisperQueueSize] = useState(0);
+    const [whisperProcessingDelayMs, setWhisperProcessingDelayMs] = useState(0);
+    const [finalFlushDurationMs, setFinalFlushDurationMs] = useState(0);
+    const [whisperBeamSize, setWhisperBeamSize] = useState(2);
+    const [whisperActiveJobs, setWhisperActiveJobs] = useState(0);
+    const [processingProgress, setProcessingProgress] = useState(0);
 
     useEffect(() => {
         isRecordingRef.current = isRecording;
@@ -250,6 +300,26 @@ export default function Recorder() {
         window.addEventListener("keydown", onKeyDown);
         return () => window.removeEventListener("keydown", onKeyDown);
     }, []);
+
+    useEffect(() => {
+        if (status !== "processing") {
+            processingStartedAtRef.current = null;
+            return;
+        }
+
+        if (processingStartedAtRef.current === null) {
+            processingStartedAtRef.current = Date.now();
+        }
+
+        const timer = window.setInterval(() => {
+            const startedAt = processingStartedAtRef.current ?? Date.now();
+            const elapsedMs = Date.now() - startedAt;
+            const target = Math.min(94, 12 + elapsedMs / 42);
+            setProcessingProgress((previous) => (previous < target ? previous * 0.72 + target * 0.28 : previous));
+        }, 90);
+
+        return () => window.clearInterval(timer);
+    }, [status]);
 
     const teardownEnergyMonitor = useCallback(() => {
         if (energyMonitorRef.current !== null) {
@@ -309,7 +379,7 @@ export default function Recorder() {
                     return;
                 }
 
-                node.getByteTimeDomainData(data);
+                node.getByteTimeDomainData(data as any);
                 let sum = 0;
                 for (let index = 0; index < data.length; index += 1) {
                     const normalized = (data[index] - 128) / 128;
@@ -356,7 +426,7 @@ export default function Recorder() {
 
     const stopRecorderOnly = useCallback(() => {
         if (recorderRef.current?.state !== "inactive") {
-            recorderRef.current.stop();
+            recorderRef.current?.stop();
         }
         recorderRef.current = null;
     }, []);
@@ -399,9 +469,17 @@ export default function Recorder() {
         setCorrectionRate(0);
         setPerceivedLatencyMs(0);
         setHesitationFilterTriggered(false);
+        setWhisperQueueSize(0);
+        setWhisperProcessingDelayMs(0);
+        setFinalFlushDurationMs(0);
+        setWhisperBeamSize(2);
+        setWhisperActiveJobs(0);
+        setProcessingProgress(0);
         lastPartialArrivalRef.current = 0;
         partialEventCountRef.current = 0;
         partialRewriteCountRef.current = 0;
+        finalLockedRef.current = false;
+        processingStartedAtRef.current = null;
     }, []);
 
     const addButtonRipple = useCallback((event: MouseEvent<HTMLButtonElement>) => {
@@ -430,6 +508,9 @@ export default function Recorder() {
         }
 
         if (pending.partial && !pending.final) {
+            if (finalLockedRef.current && !isRecordingRef.current) {
+                return;
+            }
             const previousPartial = partialRef.current;
             const smoothed = smoothPartialTail(
                 previousPartial,
@@ -441,11 +522,12 @@ export default function Recorder() {
                 stableRef.current = pending.partial.stable;
                 setStableText(pending.partial.stable);
             }
-            if (partialRef.current !== smoothed.text) {
-                partialRef.current = smoothed.text;
-                setPartialText(smoothed.text);
+            const rawPartial = pending.partial.partial || "";
+            if (partialRef.current !== rawPartial) {
+                partialRef.current = rawPartial;
+                setPartialText(rawPartial);
             }
-            setPartialConfidences(smoothed.confidences);
+            setPartialConfidences(pending.partial.partialConfidences || []);
 
             partialEventCountRef.current += 1;
             if (smoothed.rewriteDetected) {
@@ -504,6 +586,8 @@ export default function Recorder() {
             const changedIndexes = computeChangedWordIndexes(liveBeforeFinal, nextFinalText);
             const majorCorrection = shouldHighlightCorrections(liveBeforeFinal, nextFinalText, changedIndexes);
             const finalDiff = wordDiffRatio(liveBeforeFinal, nextFinalText);
+            finalLockedRef.current = true;
+            processingStartedAtRef.current = null;
 
             finalRef.current = nextFinalText;
             stableRef.current = nextFinalText;
@@ -521,6 +605,7 @@ export default function Recorder() {
             setIsThinking(false);
             setSilenceMs(0);
             setCalibrationProgress(1);
+            setProcessingProgress(100);
 
             if (correctionTimerRef.current !== null) {
                 window.clearTimeout(correctionTimerRef.current);
@@ -548,6 +633,9 @@ export default function Recorder() {
         (message: ServerMessage) => {
             switch (message.type) {
                 case "partial":
+                    if (finalLockedRef.current && !isRecordingRef.current) {
+                        return;
+                    }
                     pendingRef.current.partial = message;
                     break;
                 case "final":
@@ -555,6 +643,37 @@ export default function Recorder() {
                     break;
                 case "status":
                     pendingRef.current.status = message.state || "unknown";
+                    break;
+                case "processing":
+                    if (typeof message.status === "string") {
+                        const debugPayload = parseProcessingDebugStatus(message.status);
+                        if (debugPayload) {
+                            if (debugPayload.queueSize !== undefined) {
+                                setWhisperQueueSize(debugPayload.queueSize);
+                            }
+                            if (debugPayload.processingDelayMs !== undefined) {
+                                setWhisperProcessingDelayMs(debugPayload.processingDelayMs);
+                            }
+                            if (debugPayload.finalFlushDurationMs !== undefined) {
+                                setFinalFlushDurationMs(debugPayload.finalFlushDurationMs);
+                                if (debugPayload.finalFlushDurationMs > 0) {
+                                    setProcessingProgress((previous) => Math.max(previous, 92));
+                                }
+                            }
+                            if (debugPayload.beamSize !== undefined) {
+                                setWhisperBeamSize(debugPayload.beamSize);
+                            }
+                            if (debugPayload.activeJobs !== undefined) {
+                                setWhisperActiveJobs(debugPayload.activeJobs);
+                            }
+                            scheduleUiFlush();
+                            return;
+                        }
+                    }
+                    if (processingStartedAtRef.current === null) {
+                        processingStartedAtRef.current = Date.now();
+                    }
+                    pendingRef.current.status = "processing";
                     break;
                 case "error":
                     pendingRef.current.error = message.message;
@@ -604,6 +723,8 @@ export default function Recorder() {
         }
 
         setError("");
+        finalLockedRef.current = false;
+        processingStartedAtRef.current = null;
         setPrediction("");
         setIsThinking(false);
         setSilenceMs(0);
@@ -613,6 +734,12 @@ export default function Recorder() {
         setCorrectionRate(0);
         setPerceivedLatencyMs(0);
         setHesitationFilterTriggered(false);
+        setWhisperQueueSize(0);
+        setWhisperProcessingDelayMs(0);
+        setFinalFlushDurationMs(0);
+        setWhisperBeamSize(2);
+        setWhisperActiveJobs(0);
+        setProcessingProgress(0);
         partialEventCountRef.current = 0;
         partialRewriteCountRef.current = 0;
         lastPartialArrivalRef.current = 0;
@@ -637,6 +764,10 @@ export default function Recorder() {
                 socketRef.current?.sendAudio(buffer);
             };
 
+            recorder.onstop = () => {
+                socketRef.current?.sendCommand({ type: "stop" });
+            };
+
             socketRef.current.sendCommand({ type: "start", mimeType });
             recorder.start(CHUNK_MS);
             setIsRecording(true);
@@ -651,19 +782,29 @@ export default function Recorder() {
 
     const stopRecording = useCallback(() => {
         if (!isRecording) return;
-        stopRecorderOnly();
+
+        setIsRecording(false);
+
+        // Stop recorder FIRST. This triggers the final ondataavailable and then onstop, which notifies the backend safely.
+        if (recorderRef.current && recorderRef.current.state !== "inactive") {
+            recorderRef.current.stop();
+        }
+        recorderRef.current = null;
+
+        // Then stop tracks
         stopTracks();
         teardownEnergyMonitor();
-        socketRef.current?.sendCommand({ type: "stop" });
-        setIsRecording(false);
+
         setStatus("processing");
+        setProcessingProgress((previous) => Math.max(previous, 8));
         setIsThinking(false);
         setHesitationFilterTriggered(false);
+
         if (recorderTimerRef.current !== null) {
             window.clearInterval(recorderTimerRef.current);
             recorderTimerRef.current = null;
         }
-    }, [isRecording, stopRecorderOnly, stopTracks, teardownEnergyMonitor]);
+    }, [isRecording, stopTracks, teardownEnergyMonitor]);
 
     const handlePrimaryAction = async (event: MouseEvent<HTMLButtonElement>) => {
         addButtonRipple(event);
@@ -725,7 +866,7 @@ export default function Recorder() {
     const predictionActive = predictedTail.length > 0;
 
     const dynamicState = status === "processing"
-        ? "Refining transcript..."
+        ? "🧠 Finalizing transcript..."
         : isRecording
             ? !isCalibrated
                 ? `Calibrating voice profile... ${Math.min(99, calibrationPercent)}%`
@@ -746,96 +887,85 @@ export default function Recorder() {
     const orbScale = orbMode === "listening" ? 1 + orbEnergy * 0.22 + orbRhythm * 0.05 : 1;
 
     return (
-        <div className="min-h-screen bg-[#05070c] text-white px-6 py-10" style={{ fontFamily: "'Space Grotesk', 'Segoe UI', sans-serif" }}>
-            <div className="max-w-6xl mx-auto">
-                <div className="relative overflow-hidden rounded-[2rem] border border-white/10 bg-[radial-gradient(circle_at_20%_10%,rgba(34,211,238,0.12),transparent_45%),radial-gradient(circle_at_80%_80%,rgba(59,130,246,0.12),transparent_45%),#090d15] shadow-[0_30px_80px_rgba(0,0,0,0.45)]">
-                    <div className="absolute inset-0 bg-[linear-gradient(120deg,rgba(255,255,255,0.04)_0%,transparent_35%,transparent_65%,rgba(255,255,255,0.03)_100%)]" />
-                    <div className="relative p-8 md:p-10">
-                        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-6">
-                            <div>
-                                <p className="text-xs uppercase tracking-[0.25em] text-cyan-300/80">Voxora AI Dictation</p>
-                                <h1 className="text-3xl md:text-4xl font-medium mt-2">Premium Real-Time Transcription</h1>
-                                <p className="text-sm text-white/60 mt-2">Adaptive streaming intelligence with final refinement</p>
-                            </div>
-                            <div className="text-right">
-                                <p className="text-xs uppercase tracking-[0.2em] text-white/50">Session Time</p>
-                                <p className="text-3xl font-light mt-1">{formattedTime}</p>
+        <div className="min-h-screen text-[var(--text-primary)] px-4 sm:px-6 py-4 md:py-6 flex flex-col items-center justify-center font-sans relative transition-colors duration-500">
+            <MouseGlitter isDarkMode={isDarkMode} />
+            <div className="w-full max-w-4xl mx-auto relative z-10">
+                <div className="relative glass-card rounded-[2.5rem] overflow-hidden">
+                    <div className="relative p-6 md:p-8 flex flex-col items-center">
+                        <div className="flex flex-col items-center text-center gap-2 mb-6 w-full relative">
+                            <button
+                                onClick={() => setIsDarkMode(!isDarkMode)}
+                                className="absolute right-0 top-0 p-3 rounded-full hover:bg-[var(--text-primary)] hover:bg-opacity-5 transition-colors text-[var(--text-secondary)] hover:text-[var(--accent)]"
+                                aria-label="Toggle Theme"
+                            >
+                                {isDarkMode ? <Sun size={20} /> : <Moon size={20} />}
+                            </button>
+                            <p className="text-xs uppercase tracking-[0.3em] text-[var(--accent)] font-medium">Voxora Intelligence</p>
+                            <h1 className="text-4xl md:text-5xl font-normal tracking-tight text-[var(--text-primary)]">
+                                Real-Time Dictation
+                            </h1>
+                            <div className="mt-4 glass-card px-6 py-2 rounded-full flex items-center gap-3">
+                                <span className="relative flex h-2 w-2">
+                                  {isRecording && <span className="animate-ping absolute inline-flex h-full w-full rounded-full opacity-75" style={{ backgroundColor: "var(--accent)" }}></span>}
+                                  <span className={`relative inline-flex rounded-full h-2 w-2`} style={{ backgroundColor: isRecording ? "var(--accent)" : "var(--text-tertiary)" }}></span>
+                                </span>
+                                <span className="text-sm font-mono tracking-widest text-[var(--text-secondary)]">{formattedTime}</span>
                             </div>
                         </div>
 
-                        <div className="mt-10 grid md:grid-cols-[320px_1fr] gap-8 items-start">
-                            <div className="rounded-3xl border border-white/10 bg-white/[0.03] p-6 backdrop-blur-xl">
-                                <div className="relative w-56 h-56 mx-auto">
+                        <div className="w-full flex flex-col items-center gap-8">
+                            <div className="flex flex-col items-center w-full max-w-[320px]">
+                                <div className="relative w-36 h-36 mx-auto flex items-center justify-center">
                                     <motion.div
-                                        className="absolute inset-0 rounded-full blur-2xl"
+                                        className="absolute inset-0 rounded-full"
                                         animate={
                                             orbMode === "processing"
-                                                ? { opacity: [0.45, 0.8, 0.45], scale: [1, 1.12, 1] }
+                                                ? { opacity: [0.2, 0.5, 0.2], scale: [1, 1.08, 1] }
                                                 : orbMode === "listening"
                                                     ? thoughtPause
-                                                        ? { opacity: [0.4, 0.7, 0.4], scale: [1.01, 1.06, 1.01] }
-                                                        : { opacity: 0.75 + orbEnergy * 0.25, scale: 1.02 + orbEnergy * 0.2 }
-                                                    : { opacity: [0.35, 0.55, 0.35], scale: [1, 1.06, 1] }
+                                                        ? { opacity: [0.3, 0.6, 0.3], scale: [1.02, 1.08, 1.02] }
+                                                        : { opacity: 0.6 + orbEnergy * 0.4, scale: 1.05 + orbEnergy * 0.25 }
+                                                    : { opacity: [0.1, 0.3, 0.1], scale: [1, 1.05, 1] }
                                         }
                                         transition={
                                             orbMode === "listening"
-                                                ? {
-                                                    duration: thoughtPause ? 0.9 : Math.max(0.07, 0.16 - orbRhythm * 0.08),
-                                                    ease: "linear",
-                                                }
-                                                : { duration: 2.2, repeat: Infinity, ease: "easeInOut" }
+                                                ? { duration: thoughtPause ? 1.2 : Math.max(0.1, 0.2 - orbRhythm * 0.1), ease: "easeOut" }
+                                                : { duration: 3, repeat: Infinity, ease: "easeInOut" }
                                         }
-                                        style={{
-                                            background: "radial-gradient(circle, rgba(56,189,248,0.35) 0%, rgba(14,165,233,0.08) 55%, transparent 80%)",
-                                        }}
+                                        style={{ backgroundColor: "var(--bg-orb-pulse)", filter: "blur(20px)" }}
+                                    />
+                                    
+                                    <motion.div
+                                        className="absolute inset-[15px] rounded-full border"
+                                        style={{ borderColor: "var(--border-color)", backgroundColor: "var(--bg-card)" }}
+                                        animate={{ scale: orbMode === "listening" ? 1 + orbEnergy * 0.05 : 1 }}
+                                        transition={{ duration: 0.1 }}
                                     />
 
                                     <motion.div
-                                        className="absolute inset-0 rounded-full border border-cyan-200/25"
-                                        animate={orbMode === "processing" ? { rotate: 360 } : { rotate: 0, scale: orbScale }}
-                                        transition={
-                                            orbMode === "processing"
-                                                ? { repeat: Infinity, duration: 2.5, ease: "linear" }
-                                                : { duration: thoughtPause ? 0.42 : Math.max(0.1, 0.18 - orbRhythm * 0.08) }
-                                        }
-                                        style={{
-                                            background:
-                                                orbMode === "processing"
-                                                    ? "conic-gradient(from 20deg, rgba(34,211,238,0.2), rgba(59,130,246,0.4), rgba(34,211,238,0.15))"
-                                                    : "radial-gradient(circle at 35% 25%, rgba(255,255,255,0.2), rgba(34,211,238,0.12) 40%, rgba(14,165,233,0.15) 80%)",
+                                        className="absolute inset-[30px] rounded-full shadow-lg"
+                                        style={{ 
+                                            background: orbMode === "listening" ? "var(--accent)" : "var(--bg-base)",
+                                            border: `1px solid var(--border-color)`
                                         }}
-                                    />
-
-                                    <motion.div
-                                        className="absolute inset-[20px] rounded-full border border-white/10"
-                                        animate={
-                                            orbMode === "listening"
-                                                ? thoughtPause
-                                                    ? { scale: [1, 1.03, 1] }
-                                                    : { scale: 1 + orbEnergy * 0.15 }
-                                                : orbMode === "ready"
-                                                    ? { scale: [1, 1.03, 1] }
-                                                    : { scale: [0.98, 1.02, 0.98] }
-                                        }
-                                        transition={
-                                            orbMode === "listening"
-                                                ? { duration: thoughtPause ? 1.0 : 0.1, repeat: thoughtPause ? Infinity : 0, ease: "linear" }
-                                                : { duration: 2.4, repeat: Infinity, ease: "easeInOut" }
-                                        }
-                                        style={{
-                                            background:
-                                                "radial-gradient(circle at 30% 20%, rgba(255,255,255,0.18), rgba(14,165,233,0.16) 45%, rgba(2,6,23,0.7) 100%)",
+                                        animate={{ 
+                                            scale: orbMode === "listening" ? 1 + orbEnergy * 0.1 : 1,
+                                            opacity: orbMode === "processing" ? [0.5, 1, 0.5] : 1
+                                        }}
+                                        transition={{ 
+                                            duration: orbMode === "processing" ? 1.5 : 0.1,
+                                            repeat: orbMode === "processing" ? Infinity : 0
                                         }}
                                     />
                                 </div>
 
                                 <div className="mt-6 text-center">
-                                    <p className="text-xs uppercase tracking-[0.2em] text-cyan-300/80">State</p>
-                                    <p className="text-lg mt-2">{dynamicState}</p>
-                                    <p className="text-xs text-white/55 mt-2">
+                                    <p className="text-xs uppercase tracking-[0.2em] font-medium" style={{ color: "var(--accent)" }}>State</p>
+                                    <p className="text-lg mt-2 text-[var(--text-primary)]">{dynamicState}</p>
+                                    <p className="text-xs mt-2 text-[var(--text-secondary)]">
                                         Stability {stabilityLevel} | {speechWps.toFixed(2)} w/s | {emitIntervalMs} ms
                                     </p>
-                                    <p className="text-[11px] text-white/45 mt-1">
+                                    <p className="text-[11px] mt-1 text-[var(--text-tertiary)]">
                                         {isCalibrated ? "Calibrated profile active" : `Calibrating ${Math.min(99, calibrationPercent)}%`} | Base conf {confidenceBaseline.toFixed(2)}
                                     </p>
                                 </div>
@@ -844,72 +974,86 @@ export default function Recorder() {
                                     onClick={handlePrimaryAction}
                                     whileHover={{ scale: 1.015 }}
                                     whileTap={{ scale: 0.985 }}
-                                    className={`relative mt-6 w-full overflow-hidden rounded-2xl px-5 py-3 font-medium tracking-wide transition ${
-                                        isRecording
-                                            ? "border border-red-400/60 text-red-200 bg-red-500/10"
-                                            : "text-black bg-gradient-to-r from-cyan-300 to-blue-400"
-                                    }`}
+                                    className={`relative mt-4 w-full overflow-hidden rounded-2xl px-5 py-3 font-medium tracking-wide transition ${isRecording
+                                        ? "border border-red-400/30 text-red-500 bg-red-500/10"
+                                        : "text-white"
+                                        }`}
+                                    style={!isRecording ? { backgroundColor: "var(--accent)" } : undefined}
                                 >
                                     {ripples.map((ripple) => (
                                         <span
                                             key={ripple.id}
-                                            className="pointer-events-none absolute h-24 w-24 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white/40 animate-ping"
-                                            style={{ left: ripple.x, top: ripple.y }}
+                                            className="pointer-events-none absolute h-24 w-24 -translate-x-1/2 -translate-y-1/2 rounded-full animate-ping"
+                                            style={{ left: ripple.x, top: ripple.y, backgroundColor: "var(--bg-card)", opacity: 0.4 }}
                                         />
                                     ))}
                                     <span className="relative z-10">{isRecording ? "Stop Dictation" : "Start Dictation"}</span>
                                 </motion.button>
 
-                                {error ? <p className="mt-3 text-sm text-red-300">{error}</p> : null}
+                                {error ? <p className="mt-3 text-sm text-red-500">{error}</p> : null}
                             </div>
 
-                            <div className="rounded-3xl border border-white/10 bg-white/[0.02] min-h-[380px] flex flex-col">
-                                <div className="flex items-center justify-between px-6 py-5 border-b border-white/10">
+                            <div className="w-full glass-card rounded-3xl min-h-[300px] flex flex-col relative overflow-hidden mt-6">
+                                <div className="absolute inset-0" style={{ backgroundImage: "linear-gradient(to bottom, var(--border-color), transparent)", opacity: 0.5 }} />
+                                <div className="relative flex items-center justify-between px-8 py-5 border-b" style={{ borderColor: "var(--border-color)" }}>
                                     <div>
-                                        <p className="text-xs uppercase tracking-[0.2em] text-white/55">Live Transcript</p>
-                                        <p className="text-sm text-white/60 mt-1">
+                                        <p className="text-xs uppercase tracking-[0.2em] text-[var(--accent)] font-medium">Live Transcript</p>
+                                        <p className="text-sm text-[var(--text-tertiary)] mt-1">
                                             Confirmed text stays stable. Live hypothesis shimmers until confirmed.
                                         </p>
                                     </div>
-                                    <button
-                                        onClick={copyToClipboard}
-                                        disabled={!hasLiveContent && !hasFinalContent}
-                                        className="flex items-center gap-2 px-4 py-2 rounded-xl bg-white/5 hover:bg-white/10 transition disabled:opacity-40"
-                                    >
-                                        {copied ? <Check size={16} /> : <Copy size={16} />}
-                                        Copy
-                                    </button>
+                                    <div className="flex items-center gap-2">
+                                        <button
+                                            onClick={clearTranscript}
+                                            disabled={!hasLiveContent && !hasFinalContent}
+                                            className="flex items-center gap-2 px-4 py-2 rounded-xl transition disabled:opacity-40 hover:opacity-80 hover:text-red-500"
+                                            style={{ backgroundColor: "var(--border-color)", color: "var(--text-primary)" }}
+                                        >
+                                            <Trash2 size={16} />
+                                            Clear
+                                        </button>
+                                        <button
+                                            onClick={copyToClipboard}
+                                            disabled={!hasLiveContent && !hasFinalContent}
+                                            className="flex items-center gap-2 px-4 py-2 rounded-xl transition disabled:opacity-40 hover:opacity-80"
+                                            style={{ backgroundColor: "var(--border-color)", color: "var(--text-primary)" }}
+                                        >
+                                            {copied ? <Check size={16} /> : <Copy size={16} />}
+                                            Copy
+                                        </button>
+                                    </div>
                                 </div>
 
                                 <div className="flex-1 px-6 py-5 overflow-y-auto">
                                     <AnimatePresence mode="wait" initial={false}>
                                         {!hasLiveContent && !hasFinalContent ? (
-                                            <motion.p
+                                            <motion.div
                                                 key="idle"
                                                 initial={{ opacity: 0 }}
                                                 animate={{ opacity: 0.8 }}
                                                 exit={{ opacity: 0 }}
-                                                className="text-white/40 text-lg"
+                                                className="flex h-full items-center justify-center text-[var(--text-tertiary)] text-lg md:text-xl font-normal tracking-wide text-center pt-20"
                                             >
-                                                Ready for voice input...
-                                            </motion.p>
+                                                Tap the orb to begin speaking...
+                                            </motion.div>
                                         ) : hasFinalContent ? (
                                             <motion.div
                                                 key={`final-${finalRevision}`}
-                                                initial={{ opacity: 0, y: 12 }}
-                                                animate={{ opacity: 1, y: 0 }}
-                                                exit={{ opacity: 0, y: -10 }}
-                                                transition={{ duration: 0.4, ease: "easeOut" }}
-                                                className="text-[1.08rem] md:text-[1.18rem] leading-relaxed"
+                                                initial={{ opacity: 0, filter: "blur(8px)", y: 12 }}
+                                                animate={{ opacity: 1, filter: "blur(0px)", y: 0 }}
+                                                exit={{ opacity: 0, filter: "blur(4px)", y: -10 }}
+                                                transition={{ duration: 0.5, ease: "easeOut" }}
+                                                className="text-[1.2rem] md:text-[1.4rem] leading-relaxed font-normal text-center text-[var(--text-primary)]"
                                             >
                                                 {finalWords.map((word, index) => {
                                                     const corrected = correctedWordIndexSet.has(index);
                                                     return (
                                                         <motion.span
                                                             key={`final-word-${index}-${word}`}
-                                                            className={corrected ? "text-amber-50 rounded px-1" : "text-white"}
-                                                            initial={corrected ? { backgroundColor: "rgba(251,191,36,0.45)" } : false}
-                                                            animate={corrected ? { backgroundColor: "rgba(251,191,36,0)" } : undefined}
+                                                            className={corrected ? "rounded px-1" : ""}
+                                                            style={corrected ? { color: "var(--accent)" } : undefined}
+                                                            initial={corrected ? { backgroundColor: "var(--border-color)" } : false}
+                                                            animate={corrected ? { backgroundColor: "transparent" } : undefined}
                                                             transition={corrected ? { duration: 0.5 } : undefined}
                                                         >
                                                             {word}{" "}
@@ -920,16 +1064,16 @@ export default function Recorder() {
                                         ) : (
                                             <motion.div
                                                 key="live"
-                                                initial={{ opacity: 0, y: 8 }}
-                                                animate={{ opacity: 1, y: 0 }}
-                                                exit={{ opacity: 0, y: -8 }}
-                                                transition={{ duration: 0.25 }}
-                                                className="text-[1.08rem] md:text-[1.18rem] leading-relaxed"
+                                                initial={{ opacity: 0, filter: "blur(8px)", y: 8 }}
+                                                animate={{ opacity: 1, filter: "blur(0px)", y: 0 }}
+                                                exit={{ opacity: 0, filter: "blur(4px)", y: -8 }}
+                                                transition={{ duration: 0.4, ease: "easeOut" }}
+                                                className="text-[1.2rem] md:text-[1.4rem] leading-relaxed font-normal text-center text-[var(--text-primary)]"
                                             >
                                                 <span
-                                                    className="text-white transition-[text-shadow] duration-150"
+                                                    className="transition-[text-shadow] duration-150"
                                                     style={{
-                                                        textShadow: `0 0 18px rgba(34,211,238,${(stableGlow * 0.5).toFixed(3)})`,
+                                                        textShadow: isDarkMode ? `0 0 18px rgba(52,211,153,${(stableGlow * 0.3).toFixed(3)})` : 'none',
                                                         opacity: 0.78 + confidenceHeat * 0.22,
                                                     }}
                                                 >
@@ -950,7 +1094,8 @@ export default function Recorder() {
                                                             y: { duration: Math.max(0.1, partialShiftDuration + 0.02), delay: index * staggerSeconds },
                                                             backgroundPosition: { duration: shimmerDuration, repeat: Infinity, ease: "linear" },
                                                         }}
-                                                        className="inline-block bg-gradient-to-r from-cyan-100 via-cyan-300 to-cyan-100 bg-[length:220%_100%] bg-clip-text text-transparent"
+                                                        className="inline-block bg-clip-text text-transparent"
+                                                        style={{ backgroundImage: "linear-gradient(to right, var(--text-secondary), var(--text-primary), var(--text-secondary))", backgroundSize: "220% 100%" }}
                                                     >
                                                         {word}{" "}
                                                     </motion.span>
@@ -960,7 +1105,7 @@ export default function Recorder() {
                                                         initial={{ opacity: 0, y: 4 }}
                                                         animate={{ opacity: 0.34, y: 0 }}
                                                         transition={{ duration: 0.18 }}
-                                                        className="text-cyan-200/70"
+                                                        className="text-[var(--text-tertiary)]"
                                                     >
                                                         {predictedTail}
                                                     </motion.span>
@@ -969,7 +1114,7 @@ export default function Recorder() {
                                                     <motion.span
                                                         animate={{ opacity: [0.2, 1, 0.2] }}
                                                         transition={{ repeat: Infinity, duration: cursorPulseDuration }}
-                                                        className="text-cyan-300/90"
+                                                        className="text-[var(--accent)]"
                                                     >
                                                         |
                                                     </motion.span>
@@ -979,10 +1124,36 @@ export default function Recorder() {
                                                         initial={{ opacity: 0 }}
                                                         animate={{ opacity: [0.2, 0.9, 0.2] }}
                                                         transition={{ repeat: Infinity, duration: 1.1 }}
-                                                        className="ml-2 text-cyan-200/65 text-sm align-middle"
+                                                        className="ml-2 text-[var(--accent)] text-sm align-middle"
                                                     >
                                                         ...
                                                     </motion.span>
+                                                ) : null}
+                                                {status === "processing" ? (
+                                                    <span className="ml-3 inline-flex flex-col gap-1 align-middle min-w-[220px]">
+                                                        <motion.span
+                                                            initial={{ opacity: 0 }}
+                                                            animate={{ opacity: 1 }}
+                                                            className="inline-flex items-center gap-2 text-[var(--accent)] text-sm"
+                                                        >
+                                                            <motion.span
+                                                                animate={{ rotate: 360 }}
+                                                                transition={{ repeat: Infinity, duration: 0.9, ease: "linear" }}
+                                                                className="inline-block"
+                                                            >
+                                                                ◌
+                                                            </motion.span>
+                                                            Finalizing transcript... {Math.min(99, Math.round(processingProgress))}%
+                                                        </motion.span>
+                                                        <span className="h-1.5 w-full rounded-full overflow-hidden" style={{ backgroundColor: "var(--border-color)" }}>
+                                                            <motion.span
+                                                                className="h-full block rounded-full"
+                                                                style={{ backgroundColor: "var(--accent)" }}
+                                                                animate={{ width: `${Math.max(8, Math.min(100, processingProgress))}%` }}
+                                                                transition={{ duration: 0.18, ease: "easeOut" }}
+                                                            />
+                                                        </span>
+                                                    </span>
                                                 ) : null}
                                             </motion.div>
                                         )}
@@ -997,7 +1168,8 @@ export default function Recorder() {
             <button
                 type="button"
                 onClick={() => setDebugVisible((previous) => !previous)}
-                className="fixed right-4 top-4 z-40 h-5 w-5 rounded-full border border-white/15 bg-white/5 text-[10px] text-white/45 hover:text-white/90 hover:bg-white/10 transition"
+                className="fixed right-16 top-4 z-40 h-10 w-10 flex items-center justify-center rounded-full border transition hover:opacity-75"
+                style={{ borderColor: "var(--border-color)", backgroundColor: "var(--bg-card)", color: "var(--text-tertiary)" }}
                 aria-label="Toggle debug panel (Ctrl+Shift+D)"
                 title="Toggle debug panel (Ctrl+Shift+D)"
             >
@@ -1011,8 +1183,8 @@ export default function Recorder() {
                         animate={{ opacity: 1, y: 0, scale: 1 }}
                         exit={{ opacity: 0, y: 8, scale: 0.98 }}
                         transition={{ duration: 0.2 }}
-                        className="fixed right-4 bottom-4 z-50 w-[330px] rounded-2xl border border-white/15 bg-slate-900/65 p-4 shadow-[0_20px_40px_rgba(0,0,0,0.45)] backdrop-blur-xl"
-                        style={{ fontFamily: "'IBM Plex Mono', 'Consolas', monospace" }}
+                        className="fixed right-4 bottom-4 z-50 w-[330px] rounded-2xl border p-4 backdrop-blur-xl glass-card text-[var(--text-primary)]"
+                        style={{ borderColor: "var(--border-color)", fontFamily: "'IBM Plex Mono', 'Consolas', monospace" }}
                     >
                         <div className="flex items-center justify-between text-[11px] uppercase tracking-[0.14em] text-cyan-200/80">
                             <span>Debug Metrics</span>
@@ -1041,6 +1213,20 @@ export default function Recorder() {
                                 <p className={metricTone(emitIntervalMs, 140, 190, true)}>Emit Interval: {emitIntervalMs} ms</p>
                                 <p className={metricTone(perceivedLatencyMs || emitIntervalMs + UI_BATCH_DELAY_MS, 150, 230, true)}>
                                     Perceived Latency: {(perceivedLatencyMs || emitIntervalMs + UI_BATCH_DELAY_MS).toFixed(1)} ms
+                                </p>
+                            </div>
+
+                            <div className="rounded-lg border border-white/10 bg-black/20 p-2.5">
+                                <p className="text-white/50 uppercase tracking-[0.12em] text-[10px] mb-1">Whisper</p>
+                                <p className={metricTone(whisperQueueSize, 2, 3, true)}>Queue Size: {whisperQueueSize}</p>
+                                <p className={metricTone(whisperProcessingDelayMs, 900, 1500, true)}>
+                                    Processing Delay: {whisperProcessingDelayMs.toFixed(1)} ms
+                                </p>
+                                <p className={metricTone(finalFlushDurationMs || processingProgress * 20, 1500, 2500, true)}>
+                                    Final Flush: {(finalFlushDurationMs || 0).toFixed(1)} ms
+                                </p>
+                                <p className={whisperBeamSize <= 1 ? "text-amber-300" : "text-emerald-300"}>
+                                    Beam Size: {whisperBeamSize} | Active Jobs: {whisperActiveJobs}
                                 </p>
                             </div>
 

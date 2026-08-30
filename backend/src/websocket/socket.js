@@ -67,26 +67,40 @@ function createFfmpegPipeline({ inputFormat, onAudioFrame, onEnd, onError }) {
     const command = ffmpeg()
         .input(inputStream)
         .inputFormat(inputFormat)
-        .inputOptions(["-fflags", "+nobuffer", "-flags", "low_delay"])
+        .inputOptions([
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+            "-probesize", "32",
+            "-analyzeduration", "0"
+        ])
         .noVideo()
         .audioChannels(1)
         .audioFrequency(SAMPLE_RATE)
         .audioCodec("pcm_f32le")
         .format("f32le")
         .audioFilters(`aresample=${SAMPLE_RATE}`)
-        .outputOptions(["-fflags", "+nobuffer", "-flags", "low_delay", "-flush_packets", "1"])
+        .outputOptions([
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+            "-flush_packets", "1",
+            "-max_delay", "0"
+        ])
         .on("error", (error) => onError(error));
 
     const outputStream = command.pipe();
+
     outputStream.on("data", (chunk) => slicer.push(chunk));
+
     outputStream.on("end", () => {
         slicer.flush();
         onEnd();
     });
+
     outputStream.on("error", (error) => onError(error));
 
     return {
         writeChunk(chunk) {
+            if (!chunk || chunk.length === 0) return;
             inputStream.write(chunk);
         },
         endInput() {
@@ -95,25 +109,12 @@ function createFfmpegPipeline({ inputFormat, onAudioFrame, onEnd, onError }) {
             }
         },
         destroy() {
-            try {
-                inputStream.destroy();
-            } catch {
-                // Ignore cleanup errors.
-            }
-
-            try {
-                outputStream.destroy();
-            } catch {
-                // Ignore cleanup errors.
-            }
+            try { inputStream.destroy(); } catch { }
+            try { outputStream.destroy(); } catch { }
 
             const proc = command.ffmpegProc;
             if (proc && !proc.killed) {
-                try {
-                    proc.kill("SIGKILL");
-                } catch {
-                    // Ignore cleanup errors.
-                }
+                try { proc.kill("SIGKILL"); } catch { }
             }
         },
     };
@@ -160,9 +161,15 @@ function initWebSocket(server) {
             if (!stopPending) {
                 return;
             }
+
             stopPending = false;
             clearStopFallbackTimer();
-            pythonSession.stop();
+
+            try {
+                pythonSession.stop();
+            } catch (err) {
+                console.error("Failed to send stop to Python:", err);
+            }
         };
 
         const teardownFfmpeg = () => {
@@ -220,10 +227,12 @@ function initWebSocket(server) {
 
             if (ffmpegPipeline) {
                 ffmpegPipeline.endInput();
+
+                // Increased delay for complete flush
                 stopFallbackTimer = setTimeout(() => {
                     finalizeStop();
                     teardownFfmpeg();
-                }, 250);
+                }, 600); // <-- IMPORTANT (was 250)
             } else {
                 finalizeStop();
             }
@@ -250,66 +259,15 @@ function initWebSocket(server) {
 
         pythonSession.on("event", (event) => {
             if (event.type === "partial") {
-                const hasStructuredPartial =
-                    Object.prototype.hasOwnProperty.call(event, "stable") ||
-                    Object.prototype.hasOwnProperty.call(event, "partial");
+                const stable = String(event.stable || "");
+                const partial = String(event.partial || "");
+                const combined = `${stable} ${partial}`.trim();
 
-                if (hasStructuredPartial) {
-                    const stable = String(event.stable || "");
-                    const partial = String(event.partial || "");
-                    const combined = `${stable} ${partial}`.trim();
-                    const partialConfidences = Array.isArray(event.partial_confidences)
-                        ? event.partial_confidences
-                            .map((value) => Number(value))
-                            .filter((value) => Number.isFinite(value))
-                        : [];
-                    safeSend(ws, {
-                        type: "partial",
-                        text: combined,
-                        stable,
-                        partial,
-                        partialConfidences,
-                        stabilityLevel: Number.isFinite(Number(event.stability_level))
-                            ? Number(event.stability_level)
-                            : undefined,
-                        speechWps: Number.isFinite(Number(event.speech_wps))
-                            ? Number(event.speech_wps)
-                            : undefined,
-                        emitIntervalMs: Number.isFinite(Number(event.emit_interval_ms))
-                            ? Number(event.emit_interval_ms)
-                            : undefined,
-                        rms: Number.isFinite(Number(event.rms))
-                            ? Number(event.rms)
-                            : undefined,
-                        silenceMs: Number.isFinite(Number(event.silence_ms))
-                            ? Number(event.silence_ms)
-                            : undefined,
-                        thinking: typeof event.thinking === "boolean"
-                            ? event.thinking
-                            : undefined,
-                        prediction: typeof event.prediction === "string"
-                            ? event.prediction
-                            : undefined,
-                        calibrated: typeof event.calibrated === "boolean"
-                            ? event.calibrated
-                            : undefined,
-                        calibrationProgress: Number.isFinite(Number(event.calibration_progress))
-                            ? Number(event.calibration_progress)
-                            : undefined,
-                        confidenceBaseline: Number.isFinite(Number(event.confidence_baseline))
-                            ? Number(event.confidence_baseline)
-                            : undefined,
-                    });
-                    return;
-                }
-
-                const text = String(event.text || "");
                 safeSend(ws, {
                     type: "partial",
-                    text,
-                    stable: text,
-                    partial: "",
-                    partialConfidences: [],
+                    text: combined,
+                    stable,
+                    partial
                 });
                 return;
             }
@@ -317,7 +275,7 @@ function initWebSocket(server) {
             if (event.type === "final") {
                 safeSend(ws, {
                     type: "final",
-                    text: String(event.text || ""),
+                    text: String(event.text || "")
                 });
                 return;
             }
@@ -325,7 +283,7 @@ function initWebSocket(server) {
             if (event.type === "error") {
                 safeSend(ws, {
                     type: "error",
-                    message: String(event.message || "Python transcription error"),
+                    message: String(event.message || "Python transcription error")
                 });
                 return;
             }
@@ -333,8 +291,9 @@ function initWebSocket(server) {
             if (event.type === "status") {
                 safeSend(ws, {
                     type: "status",
-                    state: String(event.state || "unknown"),
+                    state: String(event.state || "unknown")
                 });
+                return;
             }
         });
 
